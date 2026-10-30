@@ -74,6 +74,9 @@ pub struct Movie {
     pub sort_title: String,
     #[serde(default)]
     pub format: DiscFormat,
+    /// The disc is a 3D edition (stereoscopic Blu-ray or anaglyph DVD).
+    #[serde(default)]
+    pub is_3d: bool,
     #[serde(default)]
     pub year: Option<u16>,
     #[serde(default)]
@@ -153,6 +156,24 @@ impl Movie {
             }
             Some(minutes) => format!("{minutes} min"),
             None => String::new(),
+        }
+    }
+
+    /// Full format label, including the 3D marker for 3D editions.
+    pub fn format_label(&self) -> String {
+        if self.is_3d {
+            format!("{} 3D", self.format.label())
+        } else {
+            self.format.label().to_string()
+        }
+    }
+
+    /// Compact label used by the format badge in the list and details header.
+    pub fn format_badge_label(&self) -> String {
+        if self.is_3d {
+            format!("{} 3D", self.format.short_label())
+        } else {
+            self.format.short_label().to_string()
         }
     }
 
@@ -393,6 +414,17 @@ mod tests {
             collection.filter_indices("", Some(DiscFormat::BluRay)),
             vec![1]
         );
+    }
+
+    #[test]
+    fn labels_3d_editions_with_their_base_format() {
+        let mut disc = movie("1", "Dune", DiscFormat::BluRay, 2021);
+        assert_eq!(disc.format_label(), "Blu-ray");
+        assert_eq!(disc.format_badge_label(), "BD");
+
+        disc.is_3d = true;
+        assert_eq!(disc.format_label(), "Blu-ray 3D");
+        assert_eq!(disc.format_badge_label(), "BD 3D");
     }
 
     #[test]

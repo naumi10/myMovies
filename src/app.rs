@@ -139,6 +139,7 @@ struct MovieForm {
     title: String,
     sort_title: String,
     format: DiscFormat,
+    is_3d: bool,
     year: String,
     runtime: String,
     rating: String,
@@ -165,6 +166,7 @@ impl MovieForm {
             // empty value keeps the existing one unless the title changes.
             sort_title: String::new(),
             format: movie.format,
+            is_3d: movie.is_3d,
             year: movie.year.map(|year| year.to_string()).unwrap_or_default(),
             runtime: movie
                 .runtime_minutes
@@ -214,6 +216,7 @@ impl MovieForm {
 
         movie.title = title.to_string();
         movie.format = self.format;
+        movie.is_3d = self.is_3d;
         movie.year = parse_optional_number(&self.year, "Year")?;
         movie.runtime_minutes = parse_optional_number(&self.runtime, "Runtime")?;
         movie.rating = self.rating.trim().to_string();
@@ -643,7 +646,7 @@ impl MyMoviesApp {
                 ui.set_max_width(900.0);
 
                 ui.horizontal(|ui| {
-                    format_badge(ui, movie.format);
+                    format_badge(ui, &movie);
                     if !movie.collection_number.is_empty() {
                         ui.label(
                             RichText::new(format!("Collection #{}", movie.collection_number))
@@ -707,6 +710,7 @@ impl MyMoviesApp {
 
                 section_title(ui, "Details");
                 let mut facts: Vec<(&str, String)> = vec![
+                    ("Format", movie.format_label()),
                     ("Released", movie.released.clone()),
                     (
                         "Region",
@@ -1476,14 +1480,19 @@ fn draw_editor(
                     ui.end_row();
 
                     field_label(ui, "Format");
-                    egui::ComboBox::from_id_salt("format_combo")
-                        .selected_text(form.format.label())
-                        .width(160.0)
-                        .show_ui(ui, |ui| {
-                            for format in DiscFormat::ALL {
-                                ui.selectable_value(&mut form.format, format, format.label());
-                            }
-                        });
+                    ui.horizontal(|ui| {
+                        egui::ComboBox::from_id_salt("format_combo")
+                            .selected_text(form.format.label())
+                            .width(160.0)
+                            .show_ui(ui, |ui| {
+                                for format in DiscFormat::ALL {
+                                    ui.selectable_value(&mut form.format, format, format.label());
+                                }
+                            });
+                        ui.add_space(4.0);
+                        ui.checkbox(&mut form.is_3d, "3D")
+                            .on_hover_text("Stereoscopic Blu-ray or anaglyph DVD");
+                    });
                     ui.end_row();
 
                     field_label(ui, "Year");
@@ -1680,7 +1689,7 @@ fn movie_row(ui: &mut Ui, movie: &Movie, selected: bool) -> egui::Response {
             ui.spacing_mut().item_spacing.y = 1.0;
 
             ui.horizontal(|ui| {
-                format_badge(ui, movie.format);
+                format_badge(ui, movie);
                 let mut title = RichText::new(&movie.title).size(13.0);
                 if selected {
                     title = title.strong();
@@ -1709,8 +1718,8 @@ fn movie_row(ui: &mut Ui, movie: &Movie, selected: bool) -> egui::Response {
     response
 }
 
-fn format_badge(ui: &mut Ui, format: DiscFormat) {
-    let (foreground, background) = match format {
+fn format_badge(ui: &mut Ui, movie: &Movie) {
+    let (foreground, background) = match movie.format {
         DiscFormat::Dvd => (DVD_FG, DVD_BG),
         DiscFormat::BluRay => (BD_FG, BD_BG),
         DiscFormat::UltraHd => (UHD_FG, UHD_BG),
@@ -1723,7 +1732,7 @@ fn format_badge(ui: &mut Ui, format: DiscFormat) {
         .show(ui, |ui| {
             ui.set_min_width(24.0);
             ui.label(
-                RichText::new(format.short_label())
+                RichText::new(movie.format_badge_label())
                     .size(9.5)
                     .strong()
                     .color(foreground),

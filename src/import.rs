@@ -133,6 +133,7 @@ fn parse_entry(entry: Node<'_, '_>) -> Option<Movie> {
         title,
         sort_title,
         format: parse_format(entry),
+        is_3d: parse_3d(entry),
         year,
         released: text_of(entry, "Released"),
         runtime_minutes: text_of(entry, "RunningTime").parse::<u32>().ok(),
@@ -213,6 +214,20 @@ fn parse_format(entry: Node<'_, '_>) -> DiscFormat {
     } else {
         DiscFormat::Dvd
     }
+}
+
+/// DVD Profiler stores 3D information separately from the media type.
+fn parse_3d(entry: Node<'_, '_>) -> bool {
+    let Some(dimensions) = child(entry, "Format").and_then(|format| child(format, "Dimensions"))
+    else {
+        return false;
+    };
+
+    ["Dim3DBluRay", "Dim3DAnaglyph"].iter().any(|name| {
+        child(dimensions, name)
+            .and_then(|node| node.text())
+            .is_some_and(|text| text.trim().eq_ignore_ascii_case("true"))
+    })
 }
 
 fn parse_actors(entry: Node<'_, '_>) -> Vec<Actor> {
@@ -434,6 +449,24 @@ mod tests {
         let parsed = parse_collection(xml.as_bytes()).expect("should parse");
         assert_eq!(parsed.movies[0].format, DiscFormat::BluRay);
         assert_eq!(parsed.movies[1].format, DiscFormat::UltraHd);
+    }
+
+    #[test]
+    fn detects_3d_editions_from_format_dimensions() {
+        let xml = r#"<Collection>
+          <DVD><Title>Stereo</Title><MediaTypes><DVD>false</DVD><BluRay>true</BluRay><UltraHD>false</UltraHD></MediaTypes>
+            <Format><Dimensions><Dim2D>true</Dim2D><Dim3DAnaglyph>false</Dim3DAnaglyph><Dim3DBluRay>true</Dim3DBluRay></Dimensions></Format></DVD>
+          <DVD><Title>Anaglyph</Title><MediaTypes><DVD>true</DVD><BluRay>false</BluRay><UltraHD>false</UltraHD></MediaTypes>
+            <Format><Dimensions><Dim2D>true</Dim2D><Dim3DAnaglyph>true</Dim3DAnaglyph><Dim3DBluRay>false</Dim3DBluRay></Dimensions></Format></DVD>
+          <DVD><Title>Flat</Title><MediaTypes><DVD>false</DVD><BluRay>true</BluRay><UltraHD>false</UltraHD></MediaTypes>
+            <Format><Dimensions><Dim2D>true</Dim2D><Dim3DAnaglyph>false</Dim3DAnaglyph><Dim3DBluRay>false</Dim3DBluRay></Dimensions></Format></DVD>
+        </Collection>"#;
+        let parsed = parse_collection(xml.as_bytes()).expect("should parse");
+        assert!(parsed.movies[0].is_3d);
+        assert_eq!(parsed.movies[0].format, DiscFormat::BluRay);
+        assert!(parsed.movies[1].is_3d);
+        assert_eq!(parsed.movies[1].format, DiscFormat::Dvd);
+        assert!(!parsed.movies[2].is_3d);
     }
 
     #[test]

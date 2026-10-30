@@ -556,7 +556,7 @@ impl MyMoviesApp {
                         }
                     }
                     if ui
-                        .selectable_label(self.only_3d, RichText::new("3D only").size(11.5))
+                        .selectable_label(self.only_3d, RichText::new("3D Blu-ray").size(11.5))
                         .on_hover_text("Show only 3D editions")
                         .clicked()
                     {

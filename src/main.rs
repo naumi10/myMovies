@@ -1,6 +1,7 @@
 mod app;
 mod covers;
 mod import;
+mod lookup;
 mod model;
 mod storage;
 
@@ -21,9 +22,14 @@ Usage:
 
 Environment:
   MYMOVIES_DATA                    Overrides the collection file location
+  MYMOVIES_COVERS                  Folder with front/back cover images
+  MYMOVIES_LOOKUP_SCRIPT           Path to invelos_lookup.py
+  MYMOVIES_PYTHON                  Python interpreter (default: python3)
+  MYMOVIES_LOCALITY                Invelos locality (default: 16, Finland)
 
 The GUI can import XML with the Import button; --import is a convenience for
-scripted or headless imports.
+scripted or headless imports. Add a movie with a barcode scanner by opening
+Add movie and scanning; the details are filled from Invelos.
 ";
 
 fn main() {

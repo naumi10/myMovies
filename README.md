@@ -8,6 +8,7 @@ imported directly from `Collection.xml`.
 ## Features
 
 - Manual add and edit (title is the only required field).
+- Add by barcode: scan a UPC in the Add dialog to fill details from Invelos.
 - DVD, Blu-ray and 4K Ultra HD formats.
 - Front and back cover images in the details pane, click to enlarge.
 - Import DVD Profiler XML exports (Windows-1252 or UTF-8 encoded).
@@ -73,6 +74,30 @@ The JSON file is written atomically. If it cannot be decoded at startup, it is
 renamed to `movies.json.invalid-<timestamp>` instead of being overwritten, and
 the app starts with an empty collection.
 
+## Adding a movie with a barcode scanner
+
+Open **Add movie** (`Ctrl+N`). The barcode field is focused automatically, so a
+USB barcode scanner can scan a disc and send Enter without any clicking. The
+same field also accepts a UPC typed by hand.
+
+The app runs the `invelos_lookup.py` helper in the background and fills the
+title, format, year, runtime, rating, director, cast, synopsis and UPC from the
+returned Invelos profile. Everything is still editable before saving. Any
+high-quality front/back covers the helper can download are written to the cover
+folder and shown for the new movie immediately.
+
+The lookup script is looked for at `~/invelos_lookup/invelos_lookup.py`. These
+environment variables override the defaults:
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `MYMOVIES_LOOKUP_SCRIPT` | `~/invelos_lookup/invelos_lookup.py` | Lookup helper path |
+| `MYMOVIES_PYTHON` | `python3` | Python interpreter |
+| `MYMOVIES_LOCALITY` | `16` | Invelos locality (16 is Finland) |
+
+If a barcode is not found, or the network is unavailable, the dialog shows the
+error and leaves the form untouched so the movie can still be entered manually.
+
 ## Cover images
 
 Cover images are looked up by UPC in `~/covers` (override with the
@@ -85,10 +110,12 @@ front and a back scan per disc:
 ```
 
 Multi-disc releases may add a disc suffix before the `f`/`b`, for example
-`044007867020.11f.jpg`. Hyphens and spaces in the UPC stored in the collection
-are ignored when matching, and `.jpeg` is accepted as well as `.jpg`. When a
-UPC has no matching images the covers section is simply omitted. Clicking a
-thumbnail opens a larger view; `Esc` or **Close** dismisses it.
+`044007867020.11f.jpg`. Covers downloaded by the barcode lookup are named
+`044007867020.16_front.jpg` / `_back.jpg` and are matched the same way. Hyphens
+and spaces in the UPC stored in the collection are ignored when matching, and
+`.jpeg` is accepted as well as `.jpg`. When a UPC has no matching images the
+covers section is simply omitted. Clicking a thumbnail opens a larger view; `Esc`
+or **Close** dismisses it.
 
 ## Keyboard shortcuts
 
@@ -106,6 +133,7 @@ thumbnail opens a larger view; `Esc` or **Close** dismisses it.
 | `src/model.rs` | `Movie`, `Collection`, filtering, sorting, import merge |
 | `src/covers.rs` | Cover-image directory index and UPC matching |
 | `src/import.rs` | DVD Profiler XML decoding and parsing |
+| `src/lookup.rs` | Barcode lookup through `invelos_lookup.py` |
 | `src/storage.rs` | JSON load/save and data path resolution |
 
 ## Tests

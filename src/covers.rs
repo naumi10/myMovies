@@ -116,21 +116,28 @@ enum CoverSide {
     Back,
 }
 
-/// Parses `012236047605f.jpg` into its UPC key and side. Returns `None` for
-/// files that are not JPEG covers.
+/// Parses `012236047605f.jpg` or `044007867020.16_front.jpg` into its UPC key
+/// and side. Returns `None` for files that are not JPEG covers.
 fn parse_cover_name(name: &str) -> Option<(String, CoverSide)> {
     let lower = name.to_ascii_lowercase();
     let stem = lower
         .strip_suffix(".jpeg")
         .or_else(|| lower.strip_suffix(".jpg"))?;
 
-    let (stem, side) = match stem.as_bytes().last()? {
-        b'f' => (&stem[..stem.len() - 1], CoverSide::Front),
-        b'b' => (&stem[..stem.len() - 1], CoverSide::Back),
-        _ => return None,
+    let (stem, side) = if let Some(base) = stem.strip_suffix("_front") {
+        (base, CoverSide::Front)
+    } else if let Some(base) = stem.strip_suffix("_back") {
+        (base, CoverSide::Back)
+    } else {
+        match stem.as_bytes().last()? {
+            b'f' => (&stem[..stem.len() - 1], CoverSide::Front),
+            b'b' => (&stem[..stem.len() - 1], CoverSide::Back),
+            _ => return None,
+        }
     };
 
-    // Drop an optional disc suffix such as `.11` in `044007867020.11f.jpg`.
+    // Drop an optional locality or disc suffix such as `.16` in
+    // `044007867020.16f.jpg` or `044007867020.11f.jpg`.
     let base = stem.split('.').next().unwrap_or(stem);
     let digits: String = base.chars().filter(char::is_ascii_digit).collect();
     if digits.is_empty() {
@@ -179,6 +186,20 @@ mod tests {
         let covers = index.for_upc("12569505322").unwrap();
         assert!(covers.front.is_some());
         assert!(covers.back.is_some());
+    }
+
+    #[test]
+    fn matches_lookup_script_cover_names() {
+        let index = index(&["044007867020.16_front.jpg", "044007867020.16_back.jpg"]);
+        let covers = index.for_upc("044007-867020").unwrap();
+        assert_eq!(
+            covers.front.as_deref(),
+            Some(Path::new("/covers/044007867020.16_front.jpg"))
+        );
+        assert_eq!(
+            covers.back.as_deref(),
+            Some(Path::new("/covers/044007867020.16_back.jpg"))
+        );
     }
 
     #[test]

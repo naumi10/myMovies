@@ -1,5 +1,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::time::Duration;
 
 use eframe::egui::{
     self, Align, Align2, Color32, CornerRadius, CursorIcon, FontFamily, FontId, Label, Layout,
@@ -8,6 +10,7 @@ use eframe::egui::{
 
 use crate::covers::{self, CoverIndex, Covers};
 use crate::import;
+use crate::lookup;
 use crate::model::{
     Actor, Collection, DiscFormat, Movie, join_list, new_manual_id, split_list, split_multiline,
 };
@@ -55,6 +58,17 @@ pub struct MyMoviesApp {
 struct Editor {
     editing_id: Option<String>,
     form: MovieForm,
+    barcode: String,
+    lookup: LookupState,
+    focus_barcode: bool,
+}
+
+/// State of the barcode lookup running in the background.
+enum LookupState {
+    Idle,
+    Running(Receiver<Result<lookup::MovieDetails, String>>),
+    Error(String),
+    Done(String),
 }
 
 impl Editor {
@@ -62,6 +76,9 @@ impl Editor {
         Self {
             editing_id: None,
             form: MovieForm::default(),
+            barcode: String::new(),
+            lookup: LookupState::Idle,
+            focus_barcode: true,
         }
     }
 
@@ -69,6 +86,9 @@ impl Editor {
         Self {
             editing_id: Some(movie.id.clone()),
             form: MovieForm::from_movie(movie),
+            barcode: String::new(),
+            lookup: LookupState::Idle,
+            focus_barcode: false,
         }
     }
 }
@@ -117,6 +137,7 @@ impl StatusMessage {
 #[derive(Default)]
 struct MovieForm {
     title: String,
+    sort_title: String,
     format: DiscFormat,
     year: String,
     runtime: String,
@@ -140,6 +161,9 @@ impl MovieForm {
     fn from_movie(movie: &Movie) -> Self {
         Self {
             title: movie.title.clone(),
+            // Only a lookup supplies a different sort title; when editing, an
+            // empty value keeps the existing one unless the title changes.
+            sort_title: String::new(),
             format: movie.format,
             year: movie.year.map(|year| year.to_string()).unwrap_or_default(),
             runtime: movie
@@ -181,7 +205,11 @@ impl MovieForm {
         }
 
         if movie.title != title || movie.sort_title.trim().is_empty() {
-            movie.sort_title = title.to_string();
+            movie.sort_title = if self.sort_title.trim().is_empty() {
+                title.to_string()
+            } else {
+                self.sort_title.trim().to_string()
+            };
         }
 
         movie.title = title.to_string();
@@ -988,8 +1016,14 @@ impl MyMoviesApp {
             return;
         };
 
+        // A finished lookup may have downloaded covers, so rebuild the index.
+        if poll_lookup(&mut editor, ctx) {
+            self.covers = CoverIndex::scan(&covers::directory());
+        }
+
         let mut open = true;
         let mut action = None;
+        let mut lookup_requested = false;
         let title = if editor.editing_id.is_some() {
             "Edit movie"
         } else {
@@ -1003,8 +1037,13 @@ impl MyMoviesApp {
             .default_width(680.0)
             .max_height(760.0)
             .show(ctx, |ui| {
-                draw_editor(ui, &mut editor.form, &mut action);
+                draw_editor(ui, &mut editor, &mut action, &mut lookup_requested);
             });
+
+        if lookup_requested {
+            start_lookup(&mut editor);
+            ctx.request_repaint();
+        }
 
         if !open {
             action = Some(EditorAction::Cancel);
@@ -1246,7 +1285,170 @@ impl eframe::App for MyMoviesApp {
     }
 }
 
-fn draw_editor(ui: &mut Ui, form: &mut MovieForm, action: &mut Option<EditorAction>) {
+/// Checks a running lookup and fills the form when it finishes. Returns true
+/// when the cover folder should be rescanned.
+fn poll_lookup(editor: &mut Editor, ctx: &egui::Context) -> bool {
+    let received = match &editor.lookup {
+        LookupState::Running(receiver) => Some(receiver.try_recv()),
+        _ => None,
+    };
+
+    match received {
+        Some(Ok(Ok(details))) => {
+            let message = if details.front_cover || details.back_cover {
+                format!(
+                    "Filled from Invelos profile {}. Cover images were saved.",
+                    details.profile_id
+                )
+            } else {
+                format!(
+                    "Filled from Invelos profile {}. No cover images were available.",
+                    details.profile_id
+                )
+            };
+            fill_from_lookup(&mut editor.form, &details);
+            editor.barcode = details.upc;
+            editor.lookup = LookupState::Done(message);
+            true
+        }
+        Some(Ok(Err(error))) => {
+            editor.lookup = LookupState::Error(error);
+            false
+        }
+        Some(Err(TryRecvError::Empty)) => {
+            // The lookup thread has no way to wake the UI, so poll again soon.
+            ctx.request_repaint_after(Duration::from_millis(150));
+            false
+        }
+        Some(Err(TryRecvError::Disconnected)) => {
+            editor.lookup =
+                LookupState::Error("The lookup stopped before returning a result.".to_string());
+            false
+        }
+        None => false,
+    }
+}
+
+fn start_lookup(editor: &mut Editor) {
+    if matches!(editor.lookup, LookupState::Running(_)) {
+        return;
+    }
+
+    let barcode = editor.barcode.trim().to_string();
+    if barcode.is_empty() {
+        editor.lookup = LookupState::Error("Scan or type a barcode first.".to_string());
+        return;
+    }
+
+    let locality = lookup::locality();
+    let (sender, receiver) = mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = sender.send(lookup::fetch(&barcode, &locality));
+    });
+    editor.lookup = LookupState::Running(receiver);
+}
+
+fn fill_from_lookup(form: &mut MovieForm, details: &lookup::MovieDetails) {
+    form.title = details.title.clone();
+    form.sort_title = details.sort_title.clone();
+    form.format = details.format;
+    form.year = details
+        .year
+        .map(|year| year.to_string())
+        .unwrap_or_default();
+    form.runtime = details
+        .runtime_minutes
+        .map(|minutes| minutes.to_string())
+        .unwrap_or_default();
+    form.rating = details.rating.clone();
+    form.directors = details.directors.join("\n");
+    form.cast = details
+        .cast
+        .iter()
+        .map(|(name, role)| {
+            if role.is_empty() {
+                name.clone()
+            } else {
+                format!("{name} as {role}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    form.overview = details.synopsis.clone();
+    form.upc = details.upc.clone();
+    form.error = None;
+}
+
+fn draw_lookup_row(ui: &mut Ui, editor: &mut Editor, lookup_requested: &mut bool) {
+    let running = matches!(editor.lookup, LookupState::Running(_));
+    let mut submit = false;
+
+    ui.horizontal(|ui| {
+        field_label(ui, "Barcode");
+        let response = ui.add_enabled(
+            !running,
+            TextEdit::singleline(&mut editor.barcode)
+                .id(egui::Id::unique("barcode_field"))
+                .desired_width(220.0)
+                .hint_text("Scan or type a UPC"),
+        );
+        if editor.focus_barcode {
+            response.request_focus();
+            editor.focus_barcode = false;
+        }
+        if response.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter)) {
+            submit = true;
+        }
+        if ui
+            .add_enabled(!running, egui::Button::new("Look up"))
+            .clicked()
+        {
+            submit = true;
+        }
+        if running {
+            ui.spinner();
+            ui.label(RichText::new("Searching Invelos…").size(11.5).color(MUTED));
+        }
+    });
+
+    match &editor.lookup {
+        LookupState::Idle => {
+            ui.add(
+                Label::new(
+                    RichText::new(
+                        "Scan a barcode or type a UPC and press Enter to fill the details from Invelos.",
+                    )
+                    .size(11.0)
+                    .color(MUTED),
+                )
+                .wrap(),
+            );
+        }
+        LookupState::Running(_) => {}
+        LookupState::Error(error) => {
+            ui.add(Label::new(RichText::new(error).size(11.5).color(ERROR)).wrap());
+        }
+        LookupState::Done(message) => {
+            ui.add(Label::new(RichText::new(message).size(11.5).color(SUCCESS)).wrap());
+        }
+    }
+
+    if submit {
+        *lookup_requested = true;
+    }
+}
+
+fn draw_editor(
+    ui: &mut Ui,
+    editor: &mut Editor,
+    action: &mut Option<EditorAction>,
+    lookup_requested: &mut bool,
+) {
+    if editor.editing_id.is_none() {
+        draw_lookup_row(ui, editor, lookup_requested);
+        ui.add_space(8.0);
+    }
+
     ui.label(
         RichText::new("Only the title is required. Empty fields are hidden in the details view.")
             .size(11.5)
@@ -1259,6 +1461,7 @@ fn draw_editor(ui: &mut Ui, form: &mut MovieForm, action: &mut Option<EditorActi
         .max_height(540.0)
         .auto_shrink([false, false])
         .show(ui, |ui| {
+            let form = &mut editor.form;
             egui::Grid::new("movie_form")
                 .num_columns(2)
                 .spacing([14.0, 9.0])
@@ -1400,7 +1603,7 @@ fn draw_editor(ui: &mut Ui, form: &mut MovieForm, action: &mut Option<EditorActi
                 });
         });
 
-    if let Some(error) = &form.error {
+    if let Some(error) = &editor.form.error {
         ui.add_space(8.0);
         ui.label(RichText::new(error).size(12.0).color(ERROR));
     }

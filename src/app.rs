@@ -43,6 +43,7 @@ pub struct MyMoviesApp {
     selected: Option<String>,
     search: String,
     format_filter: Option<DiscFormat>,
+    only_3d: bool,
     filtered: Vec<usize>,
     list_dirty: bool,
     editor: Option<Editor>,
@@ -304,6 +305,7 @@ impl MyMoviesApp {
             selected: None,
             search: String::new(),
             format_filter: None,
+            only_3d: false,
             filtered: Vec::new(),
             list_dirty: true,
             editor: None,
@@ -325,9 +327,9 @@ impl MyMoviesApp {
     }
 
     fn refresh_filter(&mut self) {
-        self.filtered = self
-            .collection
-            .filter_indices(&self.search, self.format_filter);
+        self.filtered =
+            self.collection
+                .filter_indices(&self.search, self.format_filter, self.only_3d);
     }
 
     fn open_add(&mut self) {
@@ -538,6 +540,7 @@ impl MyMoviesApp {
                         .clicked()
                     {
                         self.format_filter = None;
+                        self.only_3d = false;
                         self.list_dirty = true;
                     }
                     for format in DiscFormat::ALL {
@@ -551,6 +554,14 @@ impl MyMoviesApp {
                             self.format_filter = Some(format);
                             self.list_dirty = true;
                         }
+                    }
+                    if ui
+                        .selectable_label(self.only_3d, RichText::new("3D only").size(11.5))
+                        .on_hover_text("Show only 3D editions")
+                        .clicked()
+                    {
+                        self.only_3d = !self.only_3d;
+                        self.list_dirty = true;
                     }
                 });
 

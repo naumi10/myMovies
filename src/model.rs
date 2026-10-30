@@ -268,13 +268,22 @@ impl Collection {
         stats
     }
 
-    /// Indices of the movies matching the search text and format filter.
-    pub fn filter_indices(&self, query: &str, format: Option<DiscFormat>) -> Vec<usize> {
+    /// Indices of the movies matching the search text, format filter and 3D
+    /// filter.
+    pub fn filter_indices(
+        &self,
+        query: &str,
+        format: Option<DiscFormat>,
+        only_3d: bool,
+    ) -> Vec<usize> {
         let query = query.trim().to_lowercase();
         self.movies
             .iter()
             .enumerate()
             .filter(|(_, movie)| {
+                if only_3d && !movie.is_3d {
+                    return false;
+                }
                 if let Some(format) = format
                     && movie.format != format
                 {
@@ -401,18 +410,28 @@ mod tests {
                     id: "2".to_string(),
                     title: "Dune".to_string(),
                     format: DiscFormat::BluRay,
+                    is_3d: true,
                     year: Some(2021),
                     ..Default::default()
                 },
             ],
         };
 
-        assert_eq!(collection.filter_indices("lieutenant", None), vec![0]);
-        assert_eq!(collection.filter_indices("keitel", None), vec![0]);
-        assert_eq!(collection.filter_indices("2021", None), vec![1]);
         assert_eq!(
-            collection.filter_indices("", Some(DiscFormat::BluRay)),
+            collection.filter_indices("lieutenant", None, false),
+            vec![0]
+        );
+        assert_eq!(collection.filter_indices("keitel", None, false), vec![0]);
+        assert_eq!(collection.filter_indices("2021", None, false), vec![1]);
+        assert_eq!(
+            collection.filter_indices("", Some(DiscFormat::BluRay), false),
             vec![1]
+        );
+        assert_eq!(collection.filter_indices("", None, true), vec![1]);
+        assert!(
+            collection
+                .filter_indices("", Some(DiscFormat::Dvd), true)
+                .is_empty()
         );
     }
 

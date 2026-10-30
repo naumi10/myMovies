@@ -1095,6 +1095,8 @@ dependencies = [
  "num-traits",
  "png",
  "tiff",
+ "zune-core",
+ "zune-jpeg",
 ]
 
 [[package]]
@@ -1355,6 +1357,7 @@ version = "0.1.0"
 dependencies = [
  "eframe",
  "encoding_rs",
+ "image",
  "rfd",
  "roxmltree",
  "serde",

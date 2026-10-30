@@ -9,6 +9,7 @@ imported directly from `Collection.xml`.
 
 - Manual add and edit (title is the only required field).
 - DVD, Blu-ray and 4K Ultra HD formats.
+- Front and back cover images in the details pane, click to enlarge.
 - Import DVD Profiler XML exports (Windows-1252 or UTF-8 encoded).
 - Re-importing updates existing titles and keeps your personal notes.
 - Search across title, cast, director, rating, year and UPC.
@@ -72,6 +73,23 @@ The JSON file is written atomically. If it cannot be decoded at startup, it is
 renamed to `movies.json.invalid-<timestamp>` instead of being overwritten, and
 the app starts with an empty collection.
 
+## Cover images
+
+Cover images are looked up by UPC in `~/covers` (override with the
+`MYMOVIES_COVERS` environment variable). The folder is expected to contain a
+front and a back scan per disc:
+
+```
+~/covers/012236047605f.jpg   front
+~/covers/012236047605b.jpg   back
+```
+
+Multi-disc releases may add a disc suffix before the `f`/`b`, for example
+`044007867020.11f.jpg`. Hyphens and spaces in the UPC stored in the collection
+are ignored when matching, and `.jpeg` is accepted as well as `.jpg`. When a
+UPC has no matching images the covers section is simply omitted. Clicking a
+thumbnail opens a larger view; `Esc` or **Close** dismisses it.
+
 ## Keyboard shortcuts
 
 | Shortcut | Action |
@@ -86,6 +104,7 @@ the app starts with an empty collection.
 | `src/main.rs` | Entry point, CLI arguments, startup and corrupt-store recovery |
 | `src/app.rs` | egui interface, dialogs and app state |
 | `src/model.rs` | `Movie`, `Collection`, filtering, sorting, import merge |
+| `src/covers.rs` | Cover-image directory index and UPC matching |
 | `src/import.rs` | DVD Profiler XML decoding and parsing |
 | `src/storage.rs` | JSON load/save and data path resolution |
 

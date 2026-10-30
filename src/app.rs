@@ -1,3 +1,4 @@
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 
 use eframe::egui::{
@@ -5,6 +6,7 @@ use eframe::egui::{
     Margin, RichText, Sense, Stroke, StrokeKind, TextEdit, TextStyle, Ui, Vec2,
 };
 
+use crate::covers::{self, CoverIndex, Covers};
 use crate::import;
 use crate::model::{
     Actor, Collection, DiscFormat, Movie, join_list, new_manual_id, split_list, split_multiline,
@@ -45,6 +47,9 @@ pub struct MyMoviesApp {
     pending_delete: Option<String>,
     status: Option<StatusMessage>,
     show_full_cast: bool,
+    covers: CoverIndex,
+    cover_textures: CoverTextures,
+    cover_viewer: Option<PathBuf>,
 }
 
 struct Editor {
@@ -275,6 +280,9 @@ impl MyMoviesApp {
             pending_delete: None,
             status: load_error.map(StatusMessage::error),
             show_full_cast: false,
+            covers: CoverIndex::scan(&covers::directory()),
+            cover_textures: CoverTextures::default(),
+            cover_viewer: None,
         };
 
         app.collection.sort();
@@ -468,8 +476,11 @@ impl MyMoviesApp {
 
                 ui.add_space(7.0);
                 ui.horizontal(|ui| {
-                    let clear_width = if self.search.is_empty() { 0.0 } else { 46.0 };
-                    let width = (ui.available_width() - clear_width).max(120.0);
+                    // Always reserve room for the Clear button. Reserving it only
+                    // when the field is non-empty would widen this row on the
+                    // frame the first character is typed, which makes the
+                    // resizable panel grow.
+                    let width = (ui.available_width() - 80.0).max(120.0);
                     let response = ui.add(
                         TextEdit::singleline(&mut self.search)
                             .id(egui::Id::unique("search_field"))
@@ -595,6 +606,7 @@ impl MyMoviesApp {
         let mut edit = false;
         let mut delete = false;
         let mut show_full_cast = self.show_full_cast;
+        let movie_covers = self.covers.for_upc(&movie.upc).cloned();
 
         egui::ScrollArea::vertical()
             .id_salt(format!("details_{}", movie.id))
@@ -653,6 +665,11 @@ impl MyMoviesApp {
                             chip(ui, genre);
                         }
                     });
+                }
+
+                if let Some(covers) = &movie_covers {
+                    section_title(ui, "Covers");
+                    draw_covers(ui, &mut self.cover_textures, covers, &mut self.cover_viewer);
                 }
 
                 if !movie.overview.is_empty() {
@@ -819,6 +836,48 @@ impl MyMoviesApp {
         }
         if delete {
             self.pending_delete = Some(movie.id);
+        }
+    }
+
+    fn cover_viewer_ui(&mut self, ctx: &egui::Context) {
+        let Some(path) = self.cover_viewer.clone() else {
+            return;
+        };
+
+        let mut open = true;
+        let mut close = false;
+        egui::Window::new("Cover")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+            .show(ctx, |ui| {
+                if let Some(texture) = self.cover_textures.get(ctx, &path) {
+                    let natural = texture.size_vec2();
+                    let scale = (620.0 / natural.x).min(720.0 / natural.y);
+                    ui.add(
+                        egui::Image::new(egui::load::SizedTexture::new(
+                            texture.id(),
+                            natural * scale,
+                        ))
+                        .corner_radius(CornerRadius::same(6)),
+                    );
+                } else {
+                    ui.label(
+                        RichText::new("Could not read this cover image.")
+                            .size(12.5)
+                            .color(ERROR),
+                    );
+                }
+
+                ui.add_space(8.0);
+                if ui.button("Close").clicked() {
+                    close = true;
+                }
+            });
+
+        if !open || close || ctx.input(|input| input.key_pressed(egui::Key::Escape)) {
+            self.cover_viewer = None;
         }
     }
 
@@ -1183,6 +1242,7 @@ impl eframe::App for MyMoviesApp {
         self.editor_ui(&ctx);
         self.import_ui(&ctx);
         self.delete_ui(&ctx);
+        self.cover_viewer_ui(&ctx);
     }
 }
 
@@ -1489,6 +1549,104 @@ fn section_title(ui: &mut Ui, title: &str) {
     ui.add_space(1.0);
     ui.separator();
     ui.add_space(6.0);
+}
+
+/// Decoded cover images, kept as GPU textures between frames.
+#[derive(Default)]
+struct CoverTextures {
+    textures: HashMap<PathBuf, egui::TextureHandle>,
+    order: VecDeque<PathBuf>,
+}
+
+impl CoverTextures {
+    /// Returns the texture for an image, decoding and uploading it on first use.
+    /// The least recently loaded covers are dropped to keep memory bounded.
+    fn get(&mut self, ctx: &egui::Context, path: &Path) -> Option<egui::TextureHandle> {
+        if let Some(texture) = self.textures.get(path) {
+            return Some(texture.clone());
+        }
+
+        let image = image::open(path).ok()?.to_rgba8();
+        let size = [image.width() as usize, image.height() as usize];
+        let pixels = egui::ColorImage::from_rgba_unmultiplied(size, image.as_raw());
+        let texture = ctx.load_texture(
+            path.file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| path.display().to_string()),
+            pixels,
+            egui::TextureOptions::LINEAR,
+        );
+
+        self.textures.insert(path.to_path_buf(), texture.clone());
+        self.order.push_back(path.to_path_buf());
+        while self.order.len() > 12 {
+            if let Some(oldest) = self.order.pop_front() {
+                self.textures.remove(&oldest);
+            }
+        }
+
+        Some(texture)
+    }
+}
+
+fn draw_covers(
+    ui: &mut Ui,
+    textures: &mut CoverTextures,
+    covers: &Covers,
+    viewer: &mut Option<PathBuf>,
+) {
+    let width = ((ui.available_width() - 24.0) / 2.0).clamp(120.0, 250.0);
+    let height = width * 1.4;
+
+    ui.horizontal(|ui| {
+        let mut first = true;
+        for (path, label) in [
+            (covers.front.as_deref(), "Front"),
+            (covers.back.as_deref(), "Back"),
+        ] {
+            let Some(path) = path else {
+                continue;
+            };
+            if !first {
+                ui.add_space(12.0);
+            }
+            first = false;
+
+            ui.vertical(|ui| {
+                if let Some(texture) = textures.get(ui.ctx(), path) {
+                    let response = ui.add(
+                        egui::Image::new(egui::load::SizedTexture::new(
+                            texture.id(),
+                            Vec2::new(width, height),
+                        ))
+                        .corner_radius(CornerRadius::same(6))
+                        .sense(Sense::click()),
+                    );
+                    if response.clicked() {
+                        *viewer = Some(path.to_path_buf());
+                    }
+                    response
+                        .on_hover_cursor(CursorIcon::PointingHand)
+                        .on_hover_text("Click to enlarge");
+                } else {
+                    let (rect, _) =
+                        ui.allocate_exact_size(Vec2::new(width, height), Sense::hover());
+                    ui.painter()
+                        .rect_filled(rect, CornerRadius::same(6), CARD_BG);
+                    ui.painter().text(
+                        rect.center(),
+                        Align2::CENTER_CENTER,
+                        "Cover not readable",
+                        FontId::proportional(11.0),
+                        MUTED,
+                    );
+                }
+
+                ui.add_space(3.0);
+                ui.label(RichText::new(label).size(11.0).color(MUTED));
+            });
+        }
+    });
 }
 
 fn fact(ui: &mut Ui, label: &str, value: &str) {

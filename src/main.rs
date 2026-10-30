@@ -1,4 +1,5 @@
 mod app;
+mod covers;
 mod import;
 mod model;
 mod storage;

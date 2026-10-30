@@ -75,11 +75,16 @@ fn run() -> Result<(), String> {
     }
 
     let (collection, load_error) = load_or_recover(&data_path);
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_title("myMovies")
+        .with_inner_size([1240.0, 820.0])
+        .with_min_inner_size([880.0, 560.0]);
+    if let Some(icon) = window_icon() {
+        viewport = viewport.with_icon(icon);
+    }
+
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_title("myMovies")
-            .with_inner_size([1240.0, 820.0])
-            .with_min_inner_size([880.0, 560.0]),
+        viewport,
         renderer: eframe::Renderer::Glow,
         ..Default::default()
     };
@@ -94,6 +99,22 @@ fn run() -> Result<(), String> {
         }),
     )
     .map_err(|error| format!("could not start the window: {error}"))
+}
+
+/// Window and taskbar icon, embedded so a packaged build carries it too.
+///
+/// The source is 256×256, which is larger than the X11 icon property accepts
+/// comfortably, so it is scaled to a crisp 128×128.
+fn window_icon() -> Option<egui::IconData> {
+    let image = image::load_from_memory(include_bytes!("../assets/myMovies.png"))
+        .ok()?
+        .to_rgba8();
+    let image = image::imageops::resize(&image, 128, 128, image::imageops::FilterType::Lanczos3);
+    Some(egui::IconData {
+        rgba: image.into_raw(),
+        width: 128,
+        height: 128,
+    })
 }
 
 fn run_import(xml_path: &Path, data_path: &Path) -> Result<(), String> {
@@ -148,5 +169,16 @@ fn load_or_recover(path: &std::path::Path) -> (Collection, Option<String>) {
                 ),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn embedded_icon_decodes_at_x11_friendly_size() {
+        let icon = super::window_icon().expect("embedded icon should decode");
+        assert_eq!(icon.width, 128);
+        assert_eq!(icon.height, 128);
+        assert_eq!(icon.rgba.len(), 128 * 128 * 4);
     }
 }

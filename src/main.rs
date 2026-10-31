@@ -23,8 +23,6 @@ Usage:
 Environment:
   MYMOVIES_DATA                    Overrides the collection file location
   MYMOVIES_COVERS                  Folder with front/back cover images
-  MYMOVIES_LOOKUP_SCRIPT           Path to invelos_lookup.py
-  MYMOVIES_PYTHON                  Python interpreter (default: python3)
   MYMOVIES_LOCALITY                Invelos locality (default: 16, Finland)
 
 The GUI can import XML with the Import button; --import is a convenience for

@@ -83,19 +83,17 @@ Open **Add movie** (`Ctrl+N`). The barcode field is focused automatically, so a
 USB barcode scanner can scan a disc and send Enter without any clicking. The
 same field also accepts a UPC typed by hand.
 
-The app runs the `invelos_lookup.py` helper in the background and fills the
-title, format, year, runtime, rating, director, cast, synopsis and UPC from the
-returned Invelos profile. Everything is still editable before saving. Any
-high-quality front/back covers the helper can download are written to the cover
+The app looks the profile up in Invelos in the background and fills the title,
+format, year, runtime, rating, director, cast, synopsis and UPC from the
+returned profile. Everything is still editable before saving. Any
+high-quality front/back covers the server returns are written to the cover
 folder and shown for the new movie immediately.
 
-The lookup script is looked for at `~/invelos_lookup/invelos_lookup.py`. These
-environment variables override the defaults:
+The lookup is built into the app; Python and a separate helper script are not
+needed. Only the Invelos locality is configurable:
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `MYMOVIES_LOOKUP_SCRIPT` | `~/invelos_lookup/invelos_lookup.py` | Lookup helper path |
-| `MYMOVIES_PYTHON` | `python3` | Python interpreter |
 | `MYMOVIES_LOCALITY` | `16` | Invelos locality (16 is Finland) |
 
 If a barcode is not found, or the network is unavailable, the dialog shows the
@@ -136,7 +134,7 @@ or **Close** dismisses it.
 | `src/model.rs` | `Movie`, `Collection`, filtering, sorting, import merge |
 | `src/covers.rs` | Cover-image directory index and UPC matching |
 | `src/import.rs` | DVD Profiler XML decoding and parsing |
-| `src/lookup.rs` | Barcode lookup through `invelos_lookup.py` |
+| `src/lookup.rs` | Native Invelos barcode lookup |
 | `src/storage.rs` | JSON load/save and data path resolution |
 
 ## Tests
@@ -144,4 +142,10 @@ or **Close** dismisses it.
 ```sh
 cargo test
 cargo clippy --all-targets
+```
+
+Two ignored tests exercise the live Invelos service (network required):
+
+```sh
+cargo test -- --ignored
 ```

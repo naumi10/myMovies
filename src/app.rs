@@ -36,6 +36,7 @@ const BD_FG: Color32 = Color32::from_rgb(111, 168, 255);
 const BD_BG: Color32 = Color32::from_rgb(28, 43, 69);
 const UHD_FG: Color32 = Color32::from_rgb(255, 196, 107);
 const UHD_BG: Color32 = Color32::from_rgb(57, 44, 24);
+const FORMAT_ICON_BG: Color32 = Color32::from_rgb(226, 231, 238);
 
 pub struct MyMoviesApp {
     collection: Collection,
@@ -54,6 +55,7 @@ pub struct MyMoviesApp {
     covers: CoverIndex,
     cover_textures: CoverTextures,
     cover_viewer: Option<PathBuf>,
+    format_icons: FormatIcons,
 }
 
 struct Editor {
@@ -316,6 +318,7 @@ impl MyMoviesApp {
             covers: CoverIndex::scan(&covers::directory()),
             cover_textures: CoverTextures::default(),
             cover_viewer: None,
+            format_icons: FormatIcons::load(&cc.egui_ctx),
         };
 
         app.collection.sort();
@@ -606,6 +609,7 @@ impl MyMoviesApp {
                 }
 
                 let filtered = self.filtered.clone();
+                let format_icons = &self.format_icons;
                 egui::ScrollArea::vertical()
                     .id_salt("movie_list")
                     .auto_shrink([false, false])
@@ -613,7 +617,7 @@ impl MyMoviesApp {
                         for index in range {
                             let movie = &self.collection.movies[filtered[index]];
                             let selected = self.selected.as_deref() == Some(movie.id.as_str());
-                            if movie_row(ui, movie, selected).clicked() {
+                            if movie_row(ui, movie, selected, format_icons).clicked() {
                                 self.selected = Some(movie.id.clone());
                                 self.show_full_cast = false;
                             }
@@ -1684,7 +1688,12 @@ fn configure_style(ctx: &egui::Context) {
     });
 }
 
-fn movie_row(ui: &mut Ui, movie: &Movie, selected: bool) -> egui::Response {
+fn movie_row(
+    ui: &mut Ui,
+    movie: &Movie,
+    selected: bool,
+    format_icons: &FormatIcons,
+) -> egui::Response {
     let fill = if selected {
         SELECTED_BG
     } else {
@@ -1700,7 +1709,7 @@ fn movie_row(ui: &mut Ui, movie: &Movie, selected: bool) -> egui::Response {
             ui.spacing_mut().item_spacing.y = 1.0;
 
             ui.horizontal(|ui| {
-                format_badge(ui, movie);
+                format_icon(ui, movie, format_icons);
                 let mut title = RichText::new(&movie.title).size(13.0);
                 if selected {
                     title = title.strong();
@@ -1727,6 +1736,81 @@ fn movie_row(ui: &mut Ui, movie: &Movie, selected: bool) -> egui::Response {
     }
 
     response
+}
+
+/// Embedded format logos shown in the collection list.
+struct FormatIcons {
+    dvd: egui::TextureHandle,
+    blu_ray: egui::TextureHandle,
+    blu_ray_3d: egui::TextureHandle,
+    ultra_hd: egui::TextureHandle,
+}
+
+impl FormatIcons {
+    fn load(ctx: &egui::Context) -> Self {
+        Self {
+            dvd: load_format_texture(
+                ctx,
+                "format-dvd",
+                include_bytes!("../assets/formats/dvd.png"),
+            ),
+            blu_ray: load_format_texture(
+                ctx,
+                "format-blu-ray",
+                include_bytes!("../assets/formats/blu_ray.png"),
+            ),
+            blu_ray_3d: load_format_texture(
+                ctx,
+                "format-blu-ray-3d",
+                include_bytes!("../assets/formats/blu_ray_3d.png"),
+            ),
+            ultra_hd: load_format_texture(
+                ctx,
+                "format-ultra-hd",
+                include_bytes!("../assets/formats/ultra_hd.png"),
+            ),
+        }
+    }
+
+    fn for_movie(&self, movie: &Movie) -> &egui::TextureHandle {
+        if movie.is_3d {
+            return &self.blu_ray_3d;
+        }
+
+        match movie.format {
+            DiscFormat::Dvd => &self.dvd,
+            DiscFormat::BluRay => &self.blu_ray,
+            DiscFormat::UltraHd => &self.ultra_hd,
+        }
+    }
+}
+
+fn load_format_texture(ctx: &egui::Context, name: &str, bytes: &[u8]) -> egui::TextureHandle {
+    let image = image::load_from_memory(bytes)
+        .expect("bundled format icon should decode")
+        .to_rgba8();
+    let size = [image.width() as usize, image.height() as usize];
+    let pixels = egui::ColorImage::from_rgba_unmultiplied(size, image.as_raw());
+    ctx.load_texture(name, pixels, egui::TextureOptions::LINEAR)
+}
+
+fn format_icon(ui: &mut Ui, movie: &Movie, icons: &FormatIcons) {
+    let texture = icons.for_movie(movie);
+    egui::Frame::new()
+        .fill(FORMAT_ICON_BG)
+        .corner_radius(CornerRadius::same(3))
+        .inner_margin(Margin::symmetric(3, 1))
+        .show(ui, |ui| {
+            ui.add(
+                egui::Image::new(egui::load::SizedTexture::new(
+                    texture.id(),
+                    Vec2::new(36.0, 18.0),
+                ))
+                .corner_radius(CornerRadius::same(2)),
+            );
+        })
+        .response
+        .on_hover_text(movie.format_label());
 }
 
 fn format_badge(ui: &mut Ui, movie: &Movie) {
@@ -1888,5 +1972,23 @@ fn string_list(ui: &mut Ui, items: &[String]) {
             ui.label(RichText::new("•").size(12.0).color(MUTED));
             ui.label(RichText::new(item).size(12.5).color(TEXT));
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn embedded_format_icons_decode() {
+        for bytes in [
+            include_bytes!("../assets/formats/dvd.png").as_slice(),
+            include_bytes!("../assets/formats/blu_ray.png").as_slice(),
+            include_bytes!("../assets/formats/blu_ray_3d.png").as_slice(),
+            include_bytes!("../assets/formats/ultra_hd.png").as_slice(),
+        ] {
+            let image = image::load_from_memory(bytes)
+                .expect("embedded format icon should decode")
+                .to_rgba8();
+            assert_eq!(image.dimensions(), (176, 88));
+        }
     }
 }

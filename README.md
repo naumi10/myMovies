@@ -9,10 +9,10 @@ imported directly from `Collection.xml`.
 
 - Manual add and edit (title is the only required field).
 - Add by barcode: scan a UPC in the Add dialog to fill details from Invelos.
-- DVD, Blu-ray and 4K Ultra HD formats, including 3D editions.
-- 3D discs show **BD 3D** (or the matching DVD/4K label) in the list and are
-  labelled in the details pane; use the **3D only** filter to hide everything
-  else. The editor has a 3D checkbox for manual and barcode-added titles.
+- DVD, Blu-ray, 3D Blu-ray and 4K Ultra HD logos in the collection list.
+- 3D discs use the 3D logo in the list and are labelled in the details pane;
+  use the **3D Blu-ray** filter to hide everything else. The editor has a 3D
+  checkbox for manual and barcode-added titles.
 - Front and back cover images in the details pane, click to enlarge.
 - Import DVD Profiler XML exports (Windows-1252 or UTF-8 encoded).
 - Re-importing updates existing titles and keeps your personal notes.

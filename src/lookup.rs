@@ -7,10 +7,12 @@ use encoding_rs::{Encoding, WINDOWS_1252};
 use flate2::read::ZlibDecoder;
 
 use crate::covers;
-use crate::model::DiscFormat;
+use crate::model::{DiscFormat, sort_title_for};
 
 const BASE_URL: &str = "http://www.invelos.com";
 const REDIRECTS_URL: &str = "http://www.invelos.com/AppData/DVDPro/redirects.inv";
+const VARIANTS_URL: &str =
+    "http://www.invelos.com/dvdpro/upcoming/GetProfileIDVariants.aspx?v=2&ID=";
 /// Match the legacy embedded-browser user-agent observed in the DVD Profiler trace.
 const USER_AGENT: &str = "Mozilla/4.0 (compatible; MSIE 8.0; Windows NT 6.2; WOW64; Trident/7.0; .NET4.0C; .NET4.0E; .NET CLR 2.0.50727; .NET CLR 3.0.30729; .NET CLR 3.5.30729; Zoom 3.6.0)";
 const MAX_PAGE_BYTES: usize = 2 * 1024 * 1024;
@@ -32,7 +34,9 @@ const CAPTURED_HQ_IMAGE_TOKENS: &[(&str, &str, &str)] = &[(
 pub struct MovieDetails {
     pub upc: String,
     pub profile_id: String,
+    pub locality: String,
     pub title: String,
+    pub original_title: String,
     pub sort_title: String,
     pub format: DiscFormat,
     pub year: Option<u16>,
@@ -45,13 +49,66 @@ pub struct MovieDetails {
     pub back_cover: bool,
 }
 
-/// The Invelos locality whose profiles should be used. Finland is 16.
+/// One matching profile returned by Invelos' variant list.
+///
+/// The same barcode can exist in several localities, each with its own title
+/// and edition. The caller chooses which profile to download.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProfileSummary {
+    pub profile_id: String,
+    pub locality: String,
+    pub title: String,
+    pub edition: String,
+}
+
+/// The preferred Invelos locality. Finland is 16.
+///
+/// This is only a preference: when a barcode has profiles in several
+/// localities the Add dialog lets the user choose instead of fetching this one
+/// blindly.
 pub fn locality() -> String {
     std::env::var("MYMOVIES_LOCALITY")
         .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
+        .and_then(|value| normalize_locality(&value).ok())
         .unwrap_or_else(|| "16".to_string())
+}
+
+/// A human-readable name for an Invelos locality ID.
+///
+/// Only IDs seen in DVD Profiler collections or variant responses are listed;
+/// unknown IDs fall back to a generic label in the UI.
+pub fn locality_name(locality: &str) -> Option<&'static str> {
+    Some(match locality {
+        "0" => "United States",
+        "1" => "New Zealand",
+        "2" => "Australia",
+        "3" => "Canada",
+        "4" => "United Kingdom",
+        "5" => "Germany",
+        "6" => "China",
+        "8" => "France",
+        "9" => "Netherlands",
+        "10" => "Spain",
+        "11" => "Sweden",
+        "12" => "Norway",
+        "13" => "Italy",
+        "14" => "Denmark",
+        "16" => "Finland",
+        "18" => "South Korea",
+        "21" => "Hong Kong",
+        "23" => "Brazil",
+        "38" => "Thailand",
+        "40" => "Austria",
+        _ => return None,
+    })
+}
+
+/// Finds every locality profile that Invelos has for a barcode.
+pub fn variants(upc: &str) -> Result<Vec<ProfileSummary>, String> {
+    let upc = normalize_upc(upc)?;
+    let url = format!("{VARIANTS_URL}{upc}");
+    let (data, _) = request_bytes(&http_agent(), &url, &[])?;
+    parse_profile_variants(&data)
 }
 
 /// Looks up a barcode against the Invelos profile service.
@@ -64,6 +121,11 @@ pub fn fetch(upc: &str, locality: &str) -> Result<MovieDetails, String> {
     fetch_with_cover_dir(upc, locality, &covers::directory())
 }
 
+/// Downloads one of the profiles returned by [`variants`].
+pub fn fetch_profile(profile_id: &str) -> Result<MovieDetails, String> {
+    fetch_profile_with_cover_dir(profile_id, &covers::directory())
+}
+
 fn fetch_with_cover_dir(
     upc: &str,
     locality: &str,
@@ -71,13 +133,17 @@ fn fetch_with_cover_dir(
 ) -> Result<MovieDetails, String> {
     let upc = normalize_upc(upc)?;
     let locality = normalize_locality(locality)?;
-    let profile_id = format!("{upc}.{locality}");
+    fetch_profile_with_cover_dir(&format!("{upc}.{locality}"), cover_directory)
+}
 
-    let agent = ureq::AgentBuilder::new()
-        .timeout(Duration::from_secs(TIMEOUT_SECONDS))
-        .redirects(10)
-        .user_agent(USER_AGENT)
-        .build();
+fn fetch_profile_with_cover_dir(
+    profile_id: &str,
+    cover_directory: &Path,
+) -> Result<MovieDetails, String> {
+    let (upc, _) = split_profile_id(profile_id)?;
+    let profile_id = profile_id.to_string();
+
+    let agent = http_agent();
 
     let (redirects, redirects_charset) = request_bytes(&agent, REDIRECTS_URL, &[])?;
     let profiles_server = server_for_type(&redirects, &redirects_charset, "Profiles")?;
@@ -148,6 +214,41 @@ fn normalize_locality(value: &str) -> Result<String, String> {
         );
     }
     Ok(number.to_string())
+}
+
+fn http_agent() -> ureq::Agent {
+    ureq::AgentBuilder::new()
+        .timeout(Duration::from_secs(TIMEOUT_SECONDS))
+        .redirects(10)
+        .user_agent(USER_AGENT)
+        .build()
+}
+
+/// Splits a profile ID into the barcode/disc ID used for its download path and
+/// the locality ID. Locality 0 (United States) is written without a suffix.
+fn split_profile_id(profile_id: &str) -> Result<(String, String), String> {
+    let profile_id = profile_id.trim();
+    if profile_id.is_empty() {
+        return Err("Invelos returned an empty profile ID.".to_string());
+    }
+
+    let (base, locality) = match profile_id.rsplit_once('.') {
+        Some((base, locality)) => (base, locality),
+        None => (profile_id, "0"),
+    };
+    if base.len() < 2 {
+        return Err("Invelos returned an invalid profile ID.".to_string());
+    }
+    if locality.is_empty()
+        || !locality.bytes().all(|byte| byte.is_ascii_digit())
+        || locality.parse::<u16>().map_or(true, |value| value > 999)
+    {
+        return Err(format!(
+            "Invelos returned an invalid locality in profile ID {profile_id}."
+        ));
+    }
+
+    Ok((base.to_string(), locality.to_string()))
 }
 
 fn request_bytes(
@@ -260,6 +361,7 @@ fn server_for_type(bytes: &[u8], charset: &str, site_type: &str) -> Result<Strin
 struct ProfileData {
     profile_id: String,
     title: String,
+    original_title: String,
     sort_title: String,
     production_year: String,
     rating: String,
@@ -322,6 +424,7 @@ fn decode_profile_doi(data: &[u8], expected_id: &str) -> Result<ProfileData, Str
     Ok(ProfileData {
         profile_id,
         title,
+        original_title: first_or_empty(117),
         sort_title: first_or_empty(97),
         production_year: first_or_empty(2),
         rating: first_or_empty(145),
@@ -353,6 +456,67 @@ fn parse_records(data: &[u8]) -> Vec<(u16, &[u8])> {
 fn decode_cp1252(raw: &[u8]) -> String {
     let (text, _, _) = WINDOWS_1252.decode(raw);
     text.trim_end_matches('\0').trim().to_string()
+}
+
+/// Reads the compact variant list returned by `GetProfileIDVariants.aspx`.
+///
+/// The response starts with a flag byte (0 means no profiles). Each profile is
+/// three CP1252 strings (ID, title, edition), each prefixed by a one-byte
+/// length and followed by a zero terminator. A final zero ends the list before
+/// the regular HTML body.
+fn parse_profile_variants(data: &[u8]) -> Result<Vec<ProfileSummary>, String> {
+    let Some(&flag) = data.first() else {
+        return Err("Invelos returned an empty variant response.".to_string());
+    };
+    if flag == 0 {
+        return Ok(Vec::new());
+    }
+    if flag != 1 {
+        return Err("Invelos returned an unreadable variant response.".to_string());
+    }
+
+    let mut offset = 1;
+    let mut variants = Vec::new();
+    loop {
+        let Some(&next) = data.get(offset) else {
+            return Err("The Invelos variant response ended unexpectedly.".to_string());
+        };
+        if next == 0 {
+            break;
+        }
+
+        let profile_id = read_variant_string(data, &mut offset)?;
+        let title = read_variant_string(data, &mut offset)?;
+        let edition = read_variant_string(data, &mut offset)?;
+        if data.get(offset) != Some(&0) {
+            return Err("Invelos returned a malformed variant list.".to_string());
+        }
+        offset += 1;
+
+        let (_, locality) = split_profile_id(&profile_id)?;
+        variants.push(ProfileSummary {
+            profile_id,
+            locality,
+            title,
+            edition,
+        });
+    }
+    Ok(variants)
+}
+
+fn read_variant_string(data: &[u8], offset: &mut usize) -> Result<String, String> {
+    let Some(&length) = data.get(*offset) else {
+        return Err("The Invelos variant response ended unexpectedly.".to_string());
+    };
+    *offset += 1;
+    let end = offset
+        .checked_add(length as usize)
+        .ok_or_else(|| "Invelos returned a malformed variant list.".to_string())?;
+    let raw = data
+        .get(*offset..end)
+        .ok_or_else(|| "Invelos returned a malformed variant list.".to_string())?;
+    *offset = end;
+    Ok(decode_cp1252(raw))
 }
 
 fn parse_cast_credit(raw: &str) -> Option<CastCredit> {
@@ -794,8 +958,9 @@ fn details_from_profile(
     if title.is_empty() {
         return Err("The Invelos profile did not contain a title.".to_string());
     }
+    let original_title = profile.original_title.trim().to_string();
     let sort_title = if profile.sort_title.trim().is_empty() {
-        title.clone()
+        sort_title_for(&title)
     } else {
         profile.sort_title.trim().to_string()
     };
@@ -859,10 +1024,24 @@ fn details_from_profile(
         .filter(|year| (1888..=2200).contains(year));
     let runtime_minutes = parse_number::<u32>(&profile.runtime_minutes);
 
+    let locality = preview
+        .fields
+        .get("Locality")
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            split_profile_id(&profile.profile_id)
+                .ok()
+                .and_then(|(_, locality)| locality_name(&locality).map(str::to_string))
+        })
+        .unwrap_or_default();
+
     Ok(MovieDetails {
         upc: upc.to_string(),
         profile_id: profile.profile_id.clone(),
+        locality,
         title,
+        original_title,
         sort_title,
         format,
         year,
@@ -964,6 +1143,7 @@ mod tests {
         let profile = decode_profile_doi(&sample_doi(), "044007867020.16").unwrap();
         assert_eq!(profile.profile_id, "044007867020.16");
         assert_eq!(profile.title, "Ihmissusi Lontoossa");
+        assert_eq!(profile.original_title, "An American Werewolf in London");
         assert_eq!(profile.sort_title, "Ihmissusi Lontoossa");
         assert_eq!(profile.production_year, "1981");
         assert_eq!(profile.rating, "18");
@@ -1083,6 +1263,8 @@ mod tests {
         let details =
             details_from_profile(&profile, &preview, "044007867020", true, false).unwrap();
         assert_eq!(details.title, "Ihmissusi Lontoossa");
+        assert_eq!(details.original_title, "An American Werewolf in London");
+        assert_eq!(details.locality, "Finland");
         assert_eq!(details.format, DiscFormat::Dvd);
         assert_eq!(details.year, Some(1981));
         assert_eq!(details.runtime_minutes, Some(93));
@@ -1113,6 +1295,7 @@ mod tests {
         let profile = ProfileData {
             profile_id: "123456789012.16".to_string(),
             title: "Fallback".to_string(),
+            original_title: String::new(),
             sort_title: String::new(),
             production_year: String::new(),
             rating: String::new(),
@@ -1126,6 +1309,7 @@ mod tests {
         );
         let details =
             details_from_profile(&profile, &preview, "123456789012", false, false).unwrap();
+        assert_eq!(details.locality, "Finland");
         assert_eq!(details.year, Some(1999));
         assert_eq!(details.directors, vec!["First Director", "Second Director"]);
         assert_eq!(
@@ -1135,6 +1319,70 @@ mod tests {
                 ("Two Actor".to_string(), String::new()),
             ]
         );
+    }
+
+    #[test]
+    fn parses_variant_lists_and_profile_ids() {
+        fn push_field(data: &mut Vec<u8>, value: &[u8]) {
+            data.push(value.len() as u8);
+            data.extend_from_slice(value);
+        }
+
+        let mut data = vec![1];
+        for (profile_id, title, edition) in [
+            (
+                b"7332431025318.11".as_slice(),
+                b"Ta Fast Tjuven".as_slice(),
+                b"The Gentleman's Collection".as_slice(),
+            ),
+            (
+                b"7332431025318.14".as_slice(),
+                b"Tyven".as_slice(),
+                b"".as_slice(),
+            ),
+            (
+                b"7332431025318.16".as_slice(),
+                b"Kylm\xe4 rinki".as_slice(),
+                b"".as_slice(),
+            ),
+        ] {
+            push_field(&mut data, profile_id);
+            push_field(&mut data, title);
+            push_field(&mut data, edition);
+            data.push(0);
+        }
+        data.extend_from_slice(b"\0\r\n\r\n<!DOCTYPE html>");
+
+        let variants = parse_profile_variants(&data).unwrap();
+        assert_eq!(variants.len(), 3);
+        assert_eq!(variants[0].profile_id, "7332431025318.11");
+        assert_eq!(variants[0].locality, "11");
+        assert_eq!(variants[0].title, "Ta Fast Tjuven");
+        assert_eq!(variants[0].edition, "The Gentleman's Collection");
+        assert_eq!(variants[1].locality, "14");
+        assert!(variants[1].edition.is_empty());
+        assert_eq!(variants[2].locality, "16");
+        assert_eq!(variants[2].title, "Kylmä rinki");
+
+        assert!(
+            parse_profile_variants(b"\0\r\n\r\n<!DOCTYPE html>")
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            split_profile_id("012236047605").unwrap(),
+            ("012236047605".to_string(), "0".to_string())
+        );
+        assert_eq!(
+            split_profile_id("012236047605.3").unwrap(),
+            ("012236047605".to_string(), "3".to_string())
+        );
+        assert!(split_profile_id("").is_err());
+        assert!(split_profile_id("1.6").is_err());
+        assert!(split_profile_id("012236047605.x").is_err());
+        assert_eq!(locality_name("11"), Some("Sweden"));
+        assert_eq!(locality_name("16"), Some("Finland"));
+        assert_eq!(locality_name("999"), None);
     }
 
     #[test]

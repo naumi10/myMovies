@@ -3,7 +3,7 @@ use std::collections::HashSet;
 use encoding_rs::WINDOWS_1252;
 use roxmltree::{Document, Node};
 
-use crate::model::{Actor, DiscFormat, Movie};
+use crate::model::{Actor, DiscFormat, Movie, sort_title_for};
 
 #[derive(Debug, Default)]
 pub struct ParsedCollection {
@@ -111,7 +111,7 @@ fn parse_entry(entry: Node<'_, '_>) -> Option<Movie> {
     if title.is_empty() {
         return None;
     }
-
+    let original_title = text_of(entry, "OriginalTitle");
     let year = text_of(entry, "ProductionYear").parse::<u16>().ok();
     let profile_id = text_of(entry, "ID");
     let upc = text_of(entry, "UPC");
@@ -125,12 +125,13 @@ fn parse_entry(entry: Node<'_, '_>) -> Option<Movie> {
 
     let mut sort_title = text_of(entry, "SortTitle");
     if sort_title.is_empty() {
-        sort_title = title.clone();
+        sort_title = sort_title_for(&title);
     }
 
     let mut movie = Movie {
         id,
         title,
+        original_title,
         sort_title,
         format: parse_format(entry),
         is_3d: parse_3d(entry),
@@ -139,11 +140,14 @@ fn parse_entry(entry: Node<'_, '_>) -> Option<Movie> {
         runtime_minutes: text_of(entry, "RunningTime").parse::<u32>().ok(),
         rating: text_of(entry, "Rating"),
         rating_details: text_of(entry, "RatingDetails"),
+        letterboxd_rating: None,
+        imdb_id: String::new(),
         genres: list_of(entry, "Genres", "Genre"),
         studios: list_of(entry, "Studios", "Studio"),
         media_companies: list_of(entry, "MediaCompanies", "MediaCompany"),
         regions: list_of(entry, "Regions", "Region"),
         country: text_of(entry, "CountryOfOrigin"),
+        locality: text_of(entry, "ID_LocalityDesc"),
         overview: clean_text(&text_of(entry, "Overview")),
         actors: parse_actors(entry),
         directors: parse_credits(entry, |credit_type, subtype| {
@@ -367,9 +371,12 @@ mod tests {
 <Collection>
   <DVD>
     <ID>012236047605</ID>
+    <ID_LocalityID>0</ID_LocalityID>
+    <ID_LocalityDesc>United States</ID_LocalityDesc>
     <MediaTypes><DVD>true</DVD><BluRay>false</BluRay><UltraHD>false</UltraHD></MediaTypes>
     <UPC>012236-047605</UPC>
     <Title>Bad Lieutenant</Title>
+    <OriginalTitle>Bad Lieutenant</OriginalTitle>
     <SortTitle>Bad Lieutenant</SortTitle>
     <ProductionYear>1992</ProductionYear>
     <RunningTime>96</RunningTime>
@@ -409,6 +416,8 @@ mod tests {
         let movie = &parsed.movies[0];
         assert_eq!(movie.id, "dvdprofiler:012236047605");
         assert_eq!(movie.title, "Bad Lieutenant");
+        assert_eq!(movie.original_title, "Bad Lieutenant");
+        assert_eq!(movie.locality, "United States");
         assert_eq!(movie.format, DiscFormat::Dvd);
         assert_eq!(movie.year, Some(1992));
         assert_eq!(movie.runtime_minutes, Some(96));

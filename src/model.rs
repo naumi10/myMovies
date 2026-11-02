@@ -3,6 +3,34 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
+/// Builds a DVD Profiler-style sort title by moving a leading English article
+/// (`The`, `A`, `An`) to the end: `The English Patient` becomes
+/// `English Patient, The`. Titles without a leading whole-word article are
+/// returned unchanged.
+pub fn sort_title_for(title: &str) -> String {
+    let title = title.trim();
+    for article in ["The", "A", "An"] {
+        let Some(rest) = strip_article(title, article) else {
+            continue;
+        };
+        let rest = rest.trim_start();
+        if rest.is_empty() {
+            return title.to_string();
+        }
+        return format!("{rest}, {}", &title[..article.len()]);
+    }
+    title.to_string()
+}
+
+fn strip_article<'a>(title: &'a str, article: &str) -> Option<&'a str> {
+    let prefix = title.get(..article.len())?;
+    if !prefix.eq_ignore_ascii_case(article) {
+        return None;
+    }
+    let rest = &title[article.len()..];
+    rest.starts_with(char::is_whitespace).then_some(rest)
+}
+
 /// The physical media type of a movie.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum DiscFormat {
@@ -71,6 +99,8 @@ pub struct Movie {
     pub id: String,
     pub title: String,
     #[serde(default)]
+    pub original_title: String,
+    #[serde(default)]
     pub sort_title: String,
     #[serde(default)]
     pub format: DiscFormat,
@@ -87,6 +117,12 @@ pub struct Movie {
     pub rating: String,
     #[serde(default)]
     pub rating_details: String,
+    /// Letterboxd rating (0.5–5) imported from a Letterboxd export.
+    #[serde(default)]
+    pub letterboxd_rating: Option<f32>,
+    /// IMDb title ID from OMDb, for example `tt0102926`.
+    #[serde(default)]
+    pub imdb_id: String,
     #[serde(default)]
     pub genres: Vec<String>,
     #[serde(default)]
@@ -97,6 +133,9 @@ pub struct Movie {
     pub regions: Vec<String>,
     #[serde(default)]
     pub country: String,
+    /// Invelos locality/country whose profile this release belongs to.
+    #[serde(default)]
+    pub locality: String,
     #[serde(default)]
     pub overview: String,
     #[serde(default)]
@@ -254,9 +293,17 @@ impl Collection {
         for movie in movies {
             if let Some(existing) = self.find_mut(&movie.id) {
                 let notes = std::mem::take(&mut existing.notes);
+                let letterboxd_rating = existing.letterboxd_rating.take();
+                let imdb_id = std::mem::take(&mut existing.imdb_id);
                 *existing = movie;
                 if existing.notes.is_empty() {
                     existing.notes = notes;
+                }
+                if existing.letterboxd_rating.is_none() {
+                    existing.letterboxd_rating = letterboxd_rating;
+                }
+                if existing.imdb_id.is_empty() {
+                    existing.imdb_id = imdb_id;
                 }
                 stats.updated += 1;
             } else {
@@ -379,6 +426,24 @@ mod tests {
     }
 
     #[test]
+    fn builds_sort_titles_from_leading_articles() {
+        assert_eq!(
+            sort_title_for("The English Patient"),
+            "English Patient, The"
+        );
+        assert_eq!(sort_title_for("A Clockwork Orange"), "Clockwork Orange, A");
+        assert_eq!(sort_title_for("An Education"), "Education, An");
+        assert_eq!(sort_title_for("the thing"), "thing, the");
+        assert_eq!(
+            sort_title_for("English Patient, The"),
+            "English Patient, The"
+        );
+        assert_eq!(sort_title_for("The"), "The");
+        assert_eq!(sort_title_for("Theatre of Blood"), "Theatre of Blood");
+        assert_eq!(sort_title_for("Annie Hall"), "Annie Hall");
+    }
+
+    #[test]
     fn sorts_by_sort_title() {
         let mut collection = Collection {
             version: 1,
@@ -457,5 +522,25 @@ mod tests {
     #[test]
     fn manual_ids_are_unique() {
         assert_ne!(new_manual_id(), new_manual_id());
+    }
+
+    #[test]
+    fn reimport_keeps_letterboxd_ratings_and_imdb_ids() {
+        let mut existing = movie("1", "The Thing", DiscFormat::BluRay, 1982);
+        existing.letterboxd_rating = Some(4.5);
+        existing.imdb_id = "tt0084787".to_string();
+        existing.notes = "Seen at the cinema".to_string();
+        let mut collection = Collection {
+            version: 1,
+            movies: vec![existing],
+        };
+
+        let stats =
+            collection.merge_imported(vec![movie("1", "The Thing", DiscFormat::BluRay, 1982)]);
+
+        assert_eq!(stats.updated, 1);
+        assert_eq!(collection.movies[0].letterboxd_rating, Some(4.5));
+        assert_eq!(collection.movies[0].imdb_id, "tt0084787");
+        assert_eq!(collection.movies[0].notes, "Seen at the cinema");
     }
 }

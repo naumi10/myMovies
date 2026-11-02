@@ -1,8 +1,10 @@
 mod app;
 mod covers;
 mod import;
+mod letterboxd;
 mod lookup;
 mod model;
+mod omdb;
 mod storage;
 
 use std::path::{Path, PathBuf};
@@ -17,17 +19,25 @@ myMovies — keep track of a DVD and Blu-ray collection
 Usage:
   myMovies                         Start the desktop app
   myMovies --import <file.xml>     Import a DVD Profiler export and exit
+  myMovies --import-letterboxd <file.zip>
+                                   Import Letterboxd ratings and exit
   myMovies --data <file.json>      Use a different collection file
   myMovies --help                  Show this help
 
 Environment:
   MYMOVIES_DATA                    Overrides the collection file location
   MYMOVIES_COVERS                  Folder with front/back cover images
-  MYMOVIES_LOCALITY                Invelos locality (default: 16, Finland)
+  MYMOVIES_LOCALITY                Preferred Invelos locality (default: 16, Finland)
 
 The GUI can import XML with the Import button; --import is a convenience for
-scripted or headless imports. Add a movie with a barcode scanner by opening
-Add movie and scanning; the details are filled from Invelos.
+scripted or headless imports. Import Letterboxd reads ratings.csv from a
+Letterboxd .zip export. Add a movie with a barcode scanner by opening Add movie
+and scanning; the details are filled from Invelos. If the barcode exists in
+several localities, the dialog lets you choose the correct profile.
+
+Use the menu in the top-right corner of the window for Import Letterboxd…,
+Import XML… and Add movie. The movie details have an Update from OMDB button
+that compares an OMDb entry with the saved details.
 ";
 
 fn main() {
@@ -39,6 +49,7 @@ fn main() {
 
 fn run() -> Result<(), String> {
     let mut import_path: Option<PathBuf> = None;
+    let mut letterboxd_path: Option<PathBuf> = None;
     let mut data_override: Option<PathBuf> = None;
     let mut args = std::env::args().skip(1);
 
@@ -49,6 +60,12 @@ fn run() -> Result<(), String> {
                     .next()
                     .ok_or_else(|| "--import requires a path to an XML file".to_string())?;
                 import_path = Some(PathBuf::from(value));
+            }
+            "--import-letterboxd" => {
+                let value = args.next().ok_or_else(|| {
+                    "--import-letterboxd requires a path to a .zip file".to_string()
+                })?;
+                letterboxd_path = Some(PathBuf::from(value));
             }
             "--data" => {
                 let value = args
@@ -70,6 +87,9 @@ fn run() -> Result<(), String> {
 
     if let Some(xml_path) = import_path {
         return run_import(&xml_path, &data_path);
+    }
+    if let Some(zip_path) = letterboxd_path {
+        return run_letterboxd_import(&zip_path, &data_path);
     }
 
     let (collection, load_error) = load_or_recover(&data_path);
@@ -130,6 +150,25 @@ fn run_import(xml_path: &Path, data_path: &Path) -> Result<(), String> {
         stats.added,
         stats.updated,
         parsed.skipped,
+        storage::display_path(data_path)
+    );
+    Ok(())
+}
+
+fn run_letterboxd_import(zip_path: &Path, data_path: &Path) -> Result<(), String> {
+    let bytes = std::fs::read(zip_path)
+        .map_err(|error| format!("could not read {}: {error}", zip_path.display()))?;
+    let ratings = letterboxd::parse_export(&bytes)?;
+
+    let mut collection = storage::load(data_path)?;
+    let stats = letterboxd::apply(&mut collection, &ratings);
+    storage::save(data_path, &collection)?;
+
+    println!(
+        "Imported {} Letterboxd ratings ({} movies rated, {} skipped) into {}",
+        stats.entries,
+        stats.rated,
+        stats.skipped,
         storage::display_path(data_path)
     );
     Ok(())

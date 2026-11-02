@@ -1,10 +1,12 @@
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use crate::model::Collection;
 
 const APP_DIR: &str = "myMovies";
 const DATA_FILE: &str = "movies.json";
+const OMDB_KEY_FILE: &str = "omdb_api_key";
 
 /// Location of the collection database.
 ///
@@ -23,6 +25,57 @@ pub fn data_path() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."));
 
     base.join(APP_DIR).join(DATA_FILE)
+}
+
+/// Location of the stored OMDb API key, beside the collection file.
+pub fn omdb_key_path(data_path: &Path) -> PathBuf {
+    data_path.with_file_name(OMDB_KEY_FILE)
+}
+
+/// Reads the saved OMDb API key. A missing or blank file means no key is known.
+pub fn load_omdb_key(data_path: &Path) -> Option<String> {
+    let key = fs::read_to_string(omdb_key_path(data_path)).ok()?;
+    let key = key.trim();
+    if key.is_empty() {
+        None
+    } else {
+        Some(key.to_string())
+    }
+}
+
+/// Stores the OMDb API key with permissions that keep it private.
+pub fn save_omdb_key(data_path: &Path, key: &str) -> Result<(), String> {
+    let path = omdb_key_path(data_path);
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(parent)
+            .map_err(|error| format!("Could not create {}: {error}", parent.display()))?;
+    }
+
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+
+    let mut file = options
+        .open(&path)
+        .map_err(|error| format!("Could not write {}: {error}", path.display()))?;
+    file.write_all(key.trim().as_bytes())
+        .map_err(|error| format!("Could not write {}: {error}", path.display()))?;
+
+    // `mode` only applies when the file is created, so tighten an existing one.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
+            .map_err(|error| format!("Could not secure {}: {error}", path.display()))?;
+    }
+
+    Ok(())
 }
 
 pub fn load(path: &Path) -> Result<Collection, String> {
@@ -104,5 +157,28 @@ mod tests {
         let path = std::env::temp_dir().join("mymovies-does-not-exist.json");
         let collection = load(&path).expect("load");
         assert!(collection.movies.is_empty());
+    }
+
+    #[test]
+    fn saves_and_loads_the_omdb_key_beside_the_collection() {
+        let directory =
+            std::env::temp_dir().join(format!("mymovies-key-test-{}", std::process::id()));
+        let path = directory.join("movies.json");
+
+        save_omdb_key(&path, "  abc123  ").expect("save key");
+        assert_eq!(omdb_key_path(&path), directory.join(OMDB_KEY_FILE));
+        assert_eq!(load_omdb_key(&path).as_deref(), Some("abc123"));
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(omdb_key_path(&path))
+                .expect("key metadata")
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+
+        let _ = fs::remove_dir_all(directory);
     }
 }

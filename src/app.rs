@@ -5,15 +5,18 @@ use std::time::Duration;
 
 use eframe::egui::{
     self, Align, Align2, Color32, CornerRadius, CursorIcon, FontFamily, FontId, Label, Layout,
-    Margin, RichText, Sense, Stroke, StrokeKind, TextEdit, TextStyle, Ui, Vec2,
+    Margin, Rect, RichText, Sense, Shape, Stroke, StrokeKind, TextEdit, TextStyle, Ui, Vec2,
 };
 
 use crate::covers::{self, CoverIndex, Covers};
 use crate::import;
+use crate::letterboxd;
 use crate::lookup;
 use crate::model::{
-    Actor, Collection, DiscFormat, Movie, join_list, new_manual_id, split_list, split_multiline,
+    Actor, Collection, DiscFormat, Movie, join_list, new_manual_id, sort_title_for, split_list,
+    split_multiline,
 };
+use crate::omdb;
 use crate::storage;
 
 const INK: Color32 = Color32::from_rgb(10, 14, 20);
@@ -52,6 +55,8 @@ pub struct MyMoviesApp {
     pending_delete: Option<String>,
     status: Option<StatusMessage>,
     show_full_cast: bool,
+    omdb_key: Option<String>,
+    omdb_dialog: Option<OmdbDialog>,
     covers: CoverIndex,
     cover_textures: CoverTextures,
     cover_viewer: Option<PathBuf>,
@@ -69,9 +74,23 @@ struct Editor {
 /// State of the barcode lookup running in the background.
 enum LookupState {
     Idle,
-    Running(Receiver<Result<lookup::MovieDetails, String>>),
+    FindingVariants {
+        barcode: String,
+        receiver: Receiver<Result<Vec<lookup::ProfileSummary>, String>>,
+    },
+    Choosing {
+        variants: Vec<lookup::ProfileSummary>,
+        selected: usize,
+    },
+    Fetching(Receiver<Result<lookup::MovieDetails, String>>),
     Error(String),
     Done(String),
+}
+
+impl LookupState {
+    fn busy(&self) -> bool {
+        matches!(self, Self::FindingVariants { .. } | Self::Fetching(_))
+    }
 }
 
 impl Editor {
@@ -100,6 +119,39 @@ impl Editor {
 struct ImportDialog {
     path: String,
     error: Option<String>,
+}
+
+struct OmdbDialog {
+    movie_id: String,
+    title: String,
+    year: Option<u16>,
+    state: OmdbState,
+}
+
+enum OmdbState {
+    /// No usable API key is known, so ask for one before fetching.
+    RequestKey {
+        input: String,
+        error: Option<String>,
+    },
+    /// The request runs on a worker thread so the window stays responsive.
+    Fetching(Receiver<Result<omdb::Details, String>>),
+    /// The response is ready and the user chooses which fields to apply.
+    Comparing {
+        details: omdb::Details,
+        changes: Vec<omdb::Change>,
+    },
+    Failed {
+        message: String,
+    },
+}
+
+enum OmdbAction {
+    Close,
+    Retry,
+    ChangeKey,
+    SaveKey(String),
+    Save,
 }
 
 struct StatusMessage {
@@ -140,6 +192,7 @@ impl StatusMessage {
 #[derive(Default)]
 struct MovieForm {
     title: String,
+    original_title: String,
     sort_title: String,
     format: DiscFormat,
     is_3d: bool,
@@ -152,6 +205,7 @@ struct MovieForm {
     cast: String,
     overview: String,
     upc: String,
+    locality: String,
     collection_number: String,
     case_type: String,
     purchase_date: String,
@@ -165,6 +219,7 @@ impl MovieForm {
     fn from_movie(movie: &Movie) -> Self {
         Self {
             title: movie.title.clone(),
+            original_title: movie.original_title.clone(),
             // Only a lookup supplies a different sort title; when editing, an
             // empty value keeps the existing one unless the title changes.
             sort_title: String::new(),
@@ -193,6 +248,7 @@ impl MovieForm {
                 .join("\n"),
             overview: movie.overview.clone(),
             upc: movie.upc.clone(),
+            locality: movie.locality.clone(),
             collection_number: movie.collection_number.clone(),
             case_type: movie.case_type.clone(),
             purchase_date: movie.purchase_date.clone(),
@@ -209,15 +265,15 @@ impl MovieForm {
             return Err("Please enter a title.".to_string());
         }
 
-        if movie.title != title || movie.sort_title.trim().is_empty() {
-            movie.sort_title = if self.sort_title.trim().is_empty() {
-                title.to_string()
-            } else {
-                self.sort_title.trim().to_string()
-            };
+        let sort_title = self.sort_title.trim();
+        if !sort_title.is_empty() {
+            movie.sort_title = sort_title.to_string();
+        } else if movie.title != title || movie.sort_title.trim().is_empty() {
+            movie.sort_title = sort_title_for(title);
         }
 
         movie.title = title.to_string();
+        movie.original_title = self.original_title.trim().to_string();
         movie.format = self.format;
         movie.is_3d = self.is_3d;
         movie.year = parse_optional_number(&self.year, "Year")?;
@@ -229,6 +285,7 @@ impl MovieForm {
         movie.actors = parse_cast(&self.cast, &movie.actors);
         movie.overview = self.overview.trim().to_string();
         movie.upc = self.upc.trim().to_string();
+        movie.locality = self.locality.trim().to_string();
         movie.collection_number = self.collection_number.trim().to_string();
         movie.case_type = self.case_type.trim().to_string();
         movie.purchase_date = self.purchase_date.trim().to_string();
@@ -301,6 +358,7 @@ impl MyMoviesApp {
     ) -> Self {
         configure_style(&cc.egui_ctx);
 
+        let omdb_key = storage::load_omdb_key(&data_path);
         let mut app = Self {
             collection,
             data_path,
@@ -315,6 +373,8 @@ impl MyMoviesApp {
             pending_delete: None,
             status: load_error.map(StatusMessage::error),
             show_full_cast: false,
+            omdb_key,
+            omdb_dialog: None,
             covers: CoverIndex::scan(&covers::directory()),
             cover_textures: CoverTextures::default(),
             cover_viewer: None,
@@ -391,6 +451,49 @@ impl MyMoviesApp {
         ))
     }
 
+    /// Asks for a Letterboxd ZIP export and merges its ratings into the
+    /// collection. The native file picker is opened directly from the toolbar,
+    /// so there is no separate import dialog.
+    fn import_letterboxd(&mut self) {
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter("Letterboxd export", &["zip"])
+            .set_title("Select a Letterboxd export")
+            .pick_file()
+        else {
+            return;
+        };
+
+        match self.apply_letterboxd_file(&path) {
+            Ok(message) => self.commit(message),
+            Err(error) => self.status = Some(StatusMessage::error(error)),
+        }
+    }
+
+    fn apply_letterboxd_file(&mut self, path: &Path) -> Result<String, String> {
+        let bytes = std::fs::read(path)
+            .map_err(|error| format!("Could not read {}: {error}", path.display()))?;
+        let ratings = letterboxd::parse_export(&bytes)?;
+        if ratings.is_empty() {
+            return Err("The Letterboxd export did not contain any ratings.".to_string());
+        }
+
+        let stats = letterboxd::apply(&mut self.collection, &ratings);
+        self.list_dirty = true;
+        let file_name = path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.display().to_string());
+        let skipped = if stats.skipped > 0 {
+            format!(", {} skipped", stats.skipped)
+        } else {
+            String::new()
+        };
+        Ok(format!(
+            "Imported {} ratings from {file_name}: {} movies rated{skipped}.",
+            stats.entries, stats.rated
+        ))
+    }
+
     fn handle_shortcuts(&mut self, ctx: &egui::Context) {
         let (new_movie, focus_search) = ctx.input(|input| {
             let command = input.modifiers.command || input.modifiers.ctrl;
@@ -440,6 +543,7 @@ impl MyMoviesApp {
     fn top_bar(&mut self, ui: &mut Ui) {
         let mut add = false;
         let mut import = false;
+        let mut import_letterboxd = false;
 
         egui::Panel::top("toolbar")
             .frame(
@@ -458,24 +562,36 @@ impl MyMoviesApp {
                     );
 
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if ui
-                            .add(
-                                egui::Button::new(RichText::new("+ Add movie").strong().color(INK))
-                                    .fill(ACCENT),
-                            )
-                            .on_hover_text("Add a movie manually (Ctrl+N)")
-                            .clicked()
-                        {
-                            add = true;
-                        }
-
-                        if ui
-                            .add(egui::Button::new(RichText::new("Import XML…")).fill(CARD_BG))
-                            .on_hover_text("Import a DVD Profiler Collection.xml")
-                            .clicked()
-                        {
-                            import = true;
-                        }
+                        let menu_button = hamburger_button(ui);
+                        egui::Popup::menu(&menu_button)
+                            .align(egui::RectAlign::BOTTOM_END)
+                            .show(|ui| {
+                                ui.set_min_width(190.0);
+                                if ui
+                                    .button("Import Letterboxd…")
+                                    .on_hover_text("Import ratings from a Letterboxd .zip export")
+                                    .clicked()
+                                {
+                                    import_letterboxd = true;
+                                    ui.close();
+                                }
+                                if ui
+                                    .button("Import XML…")
+                                    .on_hover_text("Import a DVD Profiler Collection.xml")
+                                    .clicked()
+                                {
+                                    import = true;
+                                    ui.close();
+                                }
+                                if ui
+                                    .button("Add movie")
+                                    .on_hover_text("Add a movie manually (Ctrl+N)")
+                                    .clicked()
+                                {
+                                    add = true;
+                                    ui.close();
+                                }
+                            });
                     });
                 });
             });
@@ -485,6 +601,9 @@ impl MyMoviesApp {
         }
         if import {
             self.import_dialog = Some(ImportDialog::default());
+        }
+        if import_letterboxd {
+            self.import_letterboxd();
         }
     }
 
@@ -651,6 +770,7 @@ impl MyMoviesApp {
 
         let mut edit = false;
         let mut delete = false;
+        let mut update_omdb = false;
         let mut show_full_cast = self.show_full_cast;
         let movie_covers = self.covers.for_upc(&movie.upc).cloned();
 
@@ -683,11 +803,26 @@ impl MyMoviesApp {
                         if ui.button("Edit").clicked() {
                             edit = true;
                         }
+                        if ui
+                            .button("Update from OMDB")
+                            .on_hover_text(
+                                "Compare this movie with OMDb and choose fields to update",
+                            )
+                            .clicked()
+                        {
+                            update_omdb = true;
+                        }
                     });
                 });
 
                 ui.add_space(5.0);
-                ui.label(RichText::new(&movie.title).size(29.0).strong().color(TEXT));
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(RichText::new(&movie.title).size(29.0).strong().color(TEXT));
+                    if let Some(rating) = movie.letterboxd_rating {
+                        ui.add_space(8.0);
+                        draw_rating_stars(ui, rating);
+                    }
+                });
 
                 let mut meta = Vec::new();
                 if !movie.year_label().is_empty() {
@@ -726,9 +861,14 @@ impl MyMoviesApp {
                 section_title(ui, "Details");
                 let mut facts: Vec<(&str, String)> = vec![
                     ("Format", movie.format_label()),
+                    ("Original title", movie.original_title.clone()),
                     ("Released", movie.released.clone()),
                     (
-                        "Region",
+                        if movie.format_label().starts_with("Blu-ray") {
+                            "Area Code"
+                        } else {
+                            "Region"
+                        },
                         if movie.regions.is_empty() {
                             String::new()
                         } else {
@@ -745,12 +885,14 @@ impl MyMoviesApp {
                     ),
                     ("Case", movie.case_type.clone()),
                     ("Country", movie.country.clone()),
+                    ("Locality", movie.locality.clone()),
                     ("UPC", movie.upc.clone()),
                     ("Rating details", movie.rating_details.clone()),
                     ("Location", movie.location.clone()),
                 ];
+                let imdb_url = imdb_url(&movie.imdb_id);
                 facts.retain(|(_, value)| !value.trim().is_empty());
-                if facts.is_empty() {
+                if facts.is_empty() && imdb_url.is_none() {
                     ui.label(RichText::new("No extra details.").size(12.0).color(MUTED));
                 } else {
                     egui::Grid::new("movie_facts")
@@ -760,6 +902,12 @@ impl MyMoviesApp {
                         .show(ui, |ui| {
                             for (label, value) in facts {
                                 fact(ui, label, &value);
+                            }
+                            if let Some(url) = &imdb_url {
+                                ui.label(RichText::new("IMDb").size(11.5).color(MUTED));
+                                ui.hyperlink_to(RichText::new(url).size(13.0).color(ACCENT), url)
+                                    .on_hover_text("Open this title on IMDb");
+                                ui.end_row();
                             }
                         });
                 }
@@ -882,7 +1030,344 @@ impl MyMoviesApp {
             self.open_edit(&movie);
         }
         if delete {
-            self.pending_delete = Some(movie.id);
+            self.pending_delete = Some(movie.id.clone());
+        }
+        if update_omdb {
+            self.open_omdb(&movie);
+            ui.ctx().request_repaint();
+        }
+    }
+
+    /// Starts the OMDb workflow for a movie, asking for an API key when none
+    /// has been stored yet.
+    fn open_omdb(&mut self, movie: &Movie) {
+        let dialog = OmdbDialog {
+            movie_id: movie.id.clone(),
+            title: movie.title.clone(),
+            year: movie.year,
+            state: OmdbState::RequestKey {
+                input: self.omdb_key.clone().unwrap_or_default(),
+                error: None,
+            },
+        };
+
+        if let Some(key) = self.omdb_key.clone() {
+            self.start_omdb_fetch(dialog, key);
+        } else {
+            self.omdb_dialog = Some(dialog);
+        }
+    }
+
+    fn start_omdb_fetch(&mut self, mut dialog: OmdbDialog, key: String) {
+        let (sender, receiver) = mpsc::channel();
+        let title = dialog.title.clone();
+        let year = dialog.year;
+        let worker_key = key.clone();
+        std::thread::spawn(move || {
+            let _ = sender.send(omdb::fetch(&worker_key, &title, year));
+        });
+        dialog.state = OmdbState::Fetching(receiver);
+        self.omdb_key = Some(key);
+        self.omdb_dialog = Some(dialog);
+    }
+
+    /// Polls a running OMDb request and draws the key, progress, comparison
+    /// and error windows. One dialog instance carries the movie through the
+    /// whole workflow.
+    fn omdb_ui(&mut self, ctx: &egui::Context) {
+        let Some(mut dialog) = self.omdb_dialog.take() else {
+            return;
+        };
+
+        if let OmdbState::Fetching(receiver) = &dialog.state {
+            let mut finished = None;
+            match receiver.try_recv() {
+                Ok(result) => finished = Some(result),
+                Err(TryRecvError::Empty) => {
+                    ctx.request_repaint_after(Duration::from_millis(150));
+                }
+                Err(TryRecvError::Disconnected) => {
+                    finished = Some(Err("The OMDb lookup stopped unexpectedly.".to_string()));
+                }
+            }
+
+            if let Some(result) = finished {
+                match result {
+                    Ok(details) => {
+                        let Some(movie) = self.collection.find(&dialog.movie_id) else {
+                            self.status = Some(StatusMessage::error(
+                                "This movie is no longer in the collection.".to_string(),
+                            ));
+                            return;
+                        };
+                        let changes = details.changes(movie);
+                        dialog.state = OmdbState::Comparing { details, changes };
+                    }
+                    Err(message) => dialog.state = OmdbState::Failed { message },
+                }
+            }
+        }
+
+        let mut open = true;
+        let mut action = None;
+        let lookup = match dialog.year {
+            Some(year) => format!("“{}” ({year})", dialog.title),
+            None => format!("“{}”", dialog.title),
+        };
+
+        match &mut dialog.state {
+            OmdbState::RequestKey { input, error } => {
+                egui::Window::new("OMDb API key")
+                    .open(&mut open)
+                    .collapsible(false)
+                    .resizable(false)
+                    .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+                    .default_width(470.0)
+                    .show(ctx, |ui| {
+                        ui.label(
+                            RichText::new(format!("Enter your OMDb API key to update {lookup}."))
+                                .size(12.5)
+                                .color(MUTED),
+                        );
+                        ui.add_space(8.0);
+                        ui.add(
+                            TextEdit::singleline(input)
+                                .desired_width(f32::INFINITY)
+                                .hint_text("OMDb API key"),
+                        );
+                        ui.add_space(5.0);
+                        ui.hyperlink_to(
+                            RichText::new("Get a free key at omdbapi.com")
+                                .size(11.5)
+                                .color(ACCENT),
+                            "https://www.omdbapi.com/apikey.aspx",
+                        );
+
+                        if let Some(error) = error {
+                            ui.add_space(5.0);
+                            ui.label(RichText::new(error.as_str()).size(12.0).color(ERROR));
+                        }
+
+                        ui.add_space(10.0);
+                        ui.horizontal(|ui| {
+                            if ui
+                                .add(
+                                    egui::Button::new(
+                                        RichText::new("Save and continue").strong().color(INK),
+                                    )
+                                    .fill(ACCENT),
+                                )
+                                .clicked()
+                            {
+                                let key = input.trim().to_string();
+                                if key.is_empty() {
+                                    *error = Some("Enter the API key.".to_string());
+                                } else {
+                                    action = Some(OmdbAction::SaveKey(key));
+                                }
+                            }
+                            if ui.button("Cancel").clicked() {
+                                action = Some(OmdbAction::Close);
+                            }
+                        });
+                        ui.add_space(4.0);
+                        ui.label(
+                            RichText::new(format!(
+                                "The key is stored beside your collection in {}.",
+                                storage::display_path(&storage::omdb_key_path(&self.data_path))
+                            ))
+                            .size(10.5)
+                            .color(MUTED),
+                        );
+                    });
+            }
+            OmdbState::Fetching(_) => {
+                egui::Window::new("Update from OMDB")
+                    .open(&mut open)
+                    .collapsible(false)
+                    .resizable(false)
+                    .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+                    .default_width(380.0)
+                    .show(ctx, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.spinner();
+                            ui.label(
+                                RichText::new(format!("Looking up {lookup} on OMDb…"))
+                                    .size(12.5)
+                                    .color(TEXT),
+                            );
+                        });
+                        ui.add_space(10.0);
+                        if ui.button("Cancel").clicked() {
+                            action = Some(OmdbAction::Close);
+                        }
+                    });
+            }
+            OmdbState::Comparing { changes, .. } => {
+                egui::Window::new("Update from OMDB")
+                    .open(&mut open)
+                    .collapsible(false)
+                    .resizable(true)
+                    .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+                    .default_width(660.0)
+                    .max_height(720.0)
+                    .show(ctx, |ui| {
+                        ui.label(
+                            RichText::new(format!(
+                                "Choose which OMDb values to save for {lookup}. Click a field to select it."
+                            ))
+                            .size(12.5)
+                            .color(MUTED),
+                        );
+                        ui.add_space(6.0);
+                        ui.horizontal(|ui| {
+                            if ui.button("Select all").clicked() {
+                                for change in changes.iter_mut() {
+                                    change.selected = true;
+                                }
+                            }
+                            if ui.button("Select none").clicked() {
+                                for change in changes.iter_mut() {
+                                    change.selected = false;
+                                }
+                            }
+                        });
+                        ui.add_space(8.0);
+                        egui::ScrollArea::vertical()
+                            .max_height(440.0)
+                            .auto_shrink([false, true])
+                            .show(ui, |ui| {
+                                for (index, change) in changes.iter_mut().enumerate() {
+                                    omdb_change_row(ui, index, change);
+                                    ui.add_space(7.0);
+                                }
+                            });
+
+                        ui.add_space(10.0);
+                        ui.horizontal(|ui| {
+                            let any_selected = changes.iter().any(|change| change.selected);
+                            if ui
+                                .add_enabled(
+                                    any_selected,
+                                    egui::Button::new(
+                                        RichText::new("Update movie").strong().color(INK),
+                                    )
+                                    .fill(ACCENT),
+                                )
+                                .clicked()
+                            {
+                                action = Some(OmdbAction::Save);
+                            }
+                            if ui.button("Cancel").clicked() {
+                                action = Some(OmdbAction::Close);
+                            }
+                        });
+                    });
+            }
+            OmdbState::Failed { message } => {
+                egui::Window::new("Update from OMDB")
+                    .open(&mut open)
+                    .collapsible(false)
+                    .resizable(false)
+                    .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+                    .default_width(470.0)
+                    .show(ctx, |ui| {
+                        ui.label(RichText::new(message.as_str()).size(12.5).color(ERROR));
+                        ui.add_space(6.0);
+                        ui.label(
+                            RichText::new("Check the key, the title, or your connection.")
+                                .size(11.0)
+                                .color(MUTED),
+                        );
+                        ui.add_space(10.0);
+                        ui.horizontal(|ui| {
+                            if ui.button("Try again").clicked() {
+                                action = Some(OmdbAction::Retry);
+                            }
+                            if ui.button("Change API key").clicked() {
+                                action = Some(OmdbAction::ChangeKey);
+                            }
+                            if ui.button("Cancel").clicked() {
+                                action = Some(OmdbAction::Close);
+                            }
+                        });
+                    });
+            }
+        }
+
+        if !open && action.is_none() {
+            action = Some(OmdbAction::Close);
+        }
+        if ctx.input(|input| input.key_pressed(egui::Key::Escape)) {
+            action = Some(OmdbAction::Close);
+        }
+
+        match action {
+            Some(OmdbAction::Close) => {
+                self.omdb_dialog = None;
+            }
+            Some(OmdbAction::SaveKey(key)) => match storage::save_omdb_key(&self.data_path, &key) {
+                Ok(()) => self.start_omdb_fetch(dialog, key),
+                Err(error) => {
+                    if let OmdbState::RequestKey { error: slot, .. } = &mut dialog.state {
+                        *slot = Some(error);
+                    }
+                    self.omdb_dialog = Some(dialog);
+                }
+            },
+            Some(OmdbAction::Retry) => {
+                if let Some(key) = self.omdb_key.clone() {
+                    self.start_omdb_fetch(dialog, key);
+                } else {
+                    dialog.state = OmdbState::RequestKey {
+                        input: String::new(),
+                        error: None,
+                    };
+                    self.omdb_dialog = Some(dialog);
+                }
+            }
+            Some(OmdbAction::ChangeKey) => {
+                dialog.state = OmdbState::RequestKey {
+                    input: self.omdb_key.clone().unwrap_or_default(),
+                    error: None,
+                };
+                self.omdb_dialog = Some(dialog);
+            }
+            Some(OmdbAction::Save) => {
+                let applied = match &dialog.state {
+                    OmdbState::Comparing { details, changes } => {
+                        let fields: Vec<_> = changes
+                            .iter()
+                            .filter(|change| change.selected)
+                            .map(|change| change.field)
+                            .collect();
+                        let count = fields.len();
+                        self.collection.find_mut(&dialog.movie_id).map(|movie| {
+                            details.apply(movie, fields.into_iter());
+                            (movie.title.clone(), count)
+                        })
+                    }
+                    _ => None,
+                };
+                self.omdb_dialog = None;
+                match applied {
+                    Some((title, count)) if count > 0 => self.commit(format!(
+                        "Updated “{title}” from OMDb ({count} field{}).",
+                        if count == 1 { "" } else { "s" }
+                    )),
+                    Some(_) => {
+                        self.status = Some(StatusMessage::info("No fields were selected."));
+                    }
+                    None => {
+                        self.status = Some(StatusMessage::error(
+                            "This movie is no longer in the collection.".to_string(),
+                        ));
+                    }
+                }
+            }
+            None => {
+                self.omdb_dialog = Some(dialog);
+            }
         }
     }
 
@@ -1043,6 +1528,7 @@ impl MyMoviesApp {
         let mut open = true;
         let mut action = None;
         let mut lookup_requested = false;
+        let mut profile_requested = None;
         let title = if editor.editing_id.is_some() {
             "Edit movie"
         } else {
@@ -1056,10 +1542,19 @@ impl MyMoviesApp {
             .default_width(680.0)
             .max_height(760.0)
             .show(ctx, |ui| {
-                draw_editor(ui, &mut editor, &mut action, &mut lookup_requested);
+                draw_editor(
+                    ui,
+                    &mut editor,
+                    &mut action,
+                    &mut lookup_requested,
+                    &mut profile_requested,
+                );
             });
 
-        if lookup_requested {
+        if let Some(profile_id) = profile_requested {
+            start_profile_fetch(&mut editor, profile_id);
+            ctx.request_repaint();
+        } else if lookup_requested {
             start_lookup(&mut editor);
             ctx.request_repaint();
         }
@@ -1298,22 +1793,78 @@ impl eframe::App for MyMoviesApp {
         self.details_panel(ui);
 
         self.editor_ui(&ctx);
+        self.omdb_ui(&ctx);
         self.import_ui(&ctx);
         self.delete_ui(&ctx);
         self.cover_viewer_ui(&ctx);
     }
 }
 
+enum FinishedLookup {
+    Variants {
+        barcode: String,
+        result: Result<Vec<lookup::ProfileSummary>, String>,
+    },
+    Profile(Result<lookup::MovieDetails, String>),
+    Disconnected,
+}
+
 /// Checks a running lookup and fills the form when it finishes. Returns true
 /// when the cover folder should be rescanned.
 fn poll_lookup(editor: &mut Editor, ctx: &egui::Context) -> bool {
-    let received = match &editor.lookup {
-        LookupState::Running(receiver) => Some(receiver.try_recv()),
-        _ => None,
+    let finished = match &editor.lookup {
+        LookupState::FindingVariants { barcode, receiver } => match receiver.try_recv() {
+            Ok(result) => FinishedLookup::Variants {
+                barcode: barcode.clone(),
+                result,
+            },
+            Err(TryRecvError::Empty) => {
+                // The lookup thread has no way to wake the UI, so poll again soon.
+                ctx.request_repaint_after(Duration::from_millis(150));
+                return false;
+            }
+            Err(TryRecvError::Disconnected) => FinishedLookup::Disconnected,
+        },
+        LookupState::Fetching(receiver) => match receiver.try_recv() {
+            Ok(result) => FinishedLookup::Profile(result),
+            Err(TryRecvError::Empty) => {
+                ctx.request_repaint_after(Duration::from_millis(150));
+                return false;
+            }
+            Err(TryRecvError::Disconnected) => FinishedLookup::Disconnected,
+        },
+        _ => return false,
     };
 
-    match received {
-        Some(Ok(Ok(details))) => {
+    match finished {
+        FinishedLookup::Variants {
+            barcode,
+            result: Ok(variants),
+        } => {
+            if variants.len() > 1 {
+                let preferred = lookup::locality();
+                let selected = variants
+                    .iter()
+                    .position(|variant| variant.locality == preferred)
+                    .unwrap_or(0);
+                editor.lookup = LookupState::Choosing { variants, selected };
+            } else if let Some(profile) = variants.first() {
+                start_profile_fetch(editor, profile.profile_id.clone());
+            } else {
+                // Older barcode-only lookups still work when the variant list
+                // is empty, so preserve the direct locality lookup as a
+                // fallback.
+                start_locality_fetch(editor, &barcode);
+            }
+            false
+        }
+        FinishedLookup::Variants {
+            result: Err(error), ..
+        } => {
+            editor.lookup = LookupState::Error(error);
+            false
+        }
+        FinishedLookup::Profile(Ok(details)) => {
             let message = if details.front_cover || details.back_cover {
                 format!(
                     "Filled from Invelos profile {}. Cover images were saved.",
@@ -1330,26 +1881,20 @@ fn poll_lookup(editor: &mut Editor, ctx: &egui::Context) -> bool {
             editor.lookup = LookupState::Done(message);
             true
         }
-        Some(Ok(Err(error))) => {
+        FinishedLookup::Profile(Err(error)) => {
             editor.lookup = LookupState::Error(error);
             false
         }
-        Some(Err(TryRecvError::Empty)) => {
-            // The lookup thread has no way to wake the UI, so poll again soon.
-            ctx.request_repaint_after(Duration::from_millis(150));
-            false
-        }
-        Some(Err(TryRecvError::Disconnected)) => {
+        FinishedLookup::Disconnected => {
             editor.lookup =
                 LookupState::Error("The lookup stopped before returning a result.".to_string());
             false
         }
-        None => false,
     }
 }
 
 fn start_lookup(editor: &mut Editor) {
-    if matches!(editor.lookup, LookupState::Running(_)) {
+    if editor.lookup.busy() {
         return;
     }
 
@@ -1359,16 +1904,35 @@ fn start_lookup(editor: &mut Editor) {
         return;
     }
 
+    let (sender, receiver) = mpsc::channel();
+    let requested = barcode.clone();
+    std::thread::spawn(move || {
+        let _ = sender.send(lookup::variants(&requested));
+    });
+    editor.lookup = LookupState::FindingVariants { barcode, receiver };
+}
+
+fn start_locality_fetch(editor: &mut Editor, barcode: &str) {
+    let barcode = barcode.to_string();
     let locality = lookup::locality();
     let (sender, receiver) = mpsc::channel();
     std::thread::spawn(move || {
         let _ = sender.send(lookup::fetch(&barcode, &locality));
     });
-    editor.lookup = LookupState::Running(receiver);
+    editor.lookup = LookupState::Fetching(receiver);
+}
+
+fn start_profile_fetch(editor: &mut Editor, profile_id: String) {
+    let (sender, receiver) = mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = sender.send(lookup::fetch_profile(&profile_id));
+    });
+    editor.lookup = LookupState::Fetching(receiver);
 }
 
 fn fill_from_lookup(form: &mut MovieForm, details: &lookup::MovieDetails) {
     form.title = details.title.clone();
+    form.original_title = details.original_title.clone();
     form.sort_title = details.sort_title.clone();
     form.format = details.format;
     form.year = details
@@ -1395,11 +1959,33 @@ fn fill_from_lookup(form: &mut MovieForm, details: &lookup::MovieDetails) {
         .join("\n");
     form.overview = details.synopsis.clone();
     form.upc = details.upc.clone();
+    form.locality = details.locality.clone();
     form.error = None;
 }
 
-fn draw_lookup_row(ui: &mut Ui, editor: &mut Editor, lookup_requested: &mut bool) {
-    let running = matches!(editor.lookup, LookupState::Running(_));
+fn variant_label(variant: &lookup::ProfileSummary, preferred: &str) -> String {
+    let locality = match lookup::locality_name(&variant.locality) {
+        Some(name) => format!("{name} ({})", variant.locality),
+        None => format!("Locality {}", variant.locality),
+    };
+    let mut label = format!("{locality} — {}", variant.title);
+    if !variant.edition.is_empty() {
+        label.push_str(" — ");
+        label.push_str(&variant.edition);
+    }
+    if variant.locality == preferred {
+        label.push_str("  · preferred");
+    }
+    label
+}
+
+fn draw_lookup_row(
+    ui: &mut Ui,
+    editor: &mut Editor,
+    lookup_requested: &mut bool,
+    profile_requested: &mut Option<String>,
+) {
+    let running = editor.lookup.busy();
     let mut submit = false;
 
     ui.horizontal(|ui| {
@@ -1430,7 +2016,7 @@ fn draw_lookup_row(ui: &mut Ui, editor: &mut Editor, lookup_requested: &mut bool
         }
     });
 
-    match &editor.lookup {
+    match &mut editor.lookup {
         LookupState::Idle => {
             ui.add(
                 Label::new(
@@ -1443,12 +2029,42 @@ fn draw_lookup_row(ui: &mut Ui, editor: &mut Editor, lookup_requested: &mut bool
                 .wrap(),
             );
         }
-        LookupState::Running(_) => {}
+        LookupState::FindingVariants { .. } | LookupState::Fetching(_) => {}
+        LookupState::Choosing {
+            variants, selected, ..
+        } => {
+            ui.add_space(4.0);
+            ui.add(
+                Label::new(
+                    RichText::new(
+                        "This barcode has profiles in several localities. Choose the correct one:",
+                    )
+                    .size(11.5)
+                    .color(MUTED),
+                )
+                .wrap(),
+            );
+            ui.add_space(2.0);
+            let preferred = lookup::locality();
+            for (index, variant) in variants.iter().enumerate() {
+                ui.radio_value(
+                    selected,
+                    index,
+                    RichText::new(variant_label(variant, &preferred)).size(12.0),
+                );
+            }
+            ui.add_space(4.0);
+            if ui.button("Load selected profile").clicked()
+                && let Some(variant) = variants.get(*selected)
+            {
+                *profile_requested = Some(variant.profile_id.clone());
+            }
+        }
         LookupState::Error(error) => {
-            ui.add(Label::new(RichText::new(error).size(11.5).color(ERROR)).wrap());
+            ui.add(Label::new(RichText::new(error.as_str()).size(11.5).color(ERROR)).wrap());
         }
         LookupState::Done(message) => {
-            ui.add(Label::new(RichText::new(message).size(11.5).color(SUCCESS)).wrap());
+            ui.add(Label::new(RichText::new(message.as_str()).size(11.5).color(SUCCESS)).wrap());
         }
     }
 
@@ -1462,9 +2078,10 @@ fn draw_editor(
     editor: &mut Editor,
     action: &mut Option<EditorAction>,
     lookup_requested: &mut bool,
+    profile_requested: &mut Option<String>,
 ) {
     if editor.editing_id.is_none() {
-        draw_lookup_row(ui, editor, lookup_requested);
+        draw_lookup_row(ui, editor, lookup_requested, profile_requested);
         ui.add_space(8.0);
     }
 
@@ -1491,6 +2108,14 @@ fn draw_editor(
                         TextEdit::singleline(&mut form.title)
                             .desired_width(460.0)
                             .hint_text("Required"),
+                    );
+                    ui.end_row();
+
+                    field_label(ui, "Original title");
+                    ui.add(
+                        TextEdit::singleline(&mut form.original_title)
+                            .desired_width(460.0)
+                            .hint_text("Optional"),
                     );
                     ui.end_row();
 
@@ -1579,6 +2204,14 @@ fn draw_editor(
 
                     field_label(ui, "UPC");
                     ui.add(TextEdit::singleline(&mut form.upc).desired_width(220.0));
+                    ui.end_row();
+
+                    field_label(ui, "Locality");
+                    ui.add(
+                        TextEdit::singleline(&mut form.locality)
+                            .desired_width(220.0)
+                            .hint_text("e.g. Finland"),
+                    );
                     ui.end_row();
 
                     field_label(ui, "Collection #");
@@ -1752,22 +2385,22 @@ impl FormatIcons {
             dvd: load_format_texture(
                 ctx,
                 "format-dvd",
-                include_bytes!("../assets/formats/dvd.png"),
+                include_bytes!("../assets/formats/dvd.svg"),
             ),
             blu_ray: load_format_texture(
                 ctx,
                 "format-blu-ray",
-                include_bytes!("../assets/formats/blu_ray.png"),
+                include_bytes!("../assets/formats/blu-ray.svg"),
             ),
             blu_ray_3d: load_format_texture(
                 ctx,
                 "format-blu-ray-3d",
-                include_bytes!("../assets/formats/blu_ray_3d.png"),
+                include_bytes!("../assets/formats/blu-ray-3d.svg"),
             ),
             ultra_hd: load_format_texture(
                 ctx,
                 "format-ultra-hd",
-                include_bytes!("../assets/formats/ultra_hd.png"),
+                include_bytes!("../assets/formats/4k-ultra-hd.svg"),
             ),
         }
     }
@@ -1785,13 +2418,32 @@ impl FormatIcons {
     }
 }
 
-fn load_format_texture(ctx: &egui::Context, name: &str, bytes: &[u8]) -> egui::TextureHandle {
-    let image = image::load_from_memory(bytes)
-        .expect("bundled format icon should decode")
-        .to_rgba8();
-    let size = [image.width() as usize, image.height() as usize];
-    let pixels = egui::ColorImage::from_rgba_unmultiplied(size, image.as_raw());
-    ctx.load_texture(name, pixels, egui::TextureOptions::LINEAR)
+fn load_format_texture(ctx: &egui::Context, name: &str, svg: &[u8]) -> egui::TextureHandle {
+    let image = rasterize_format_icon(svg);
+    ctx.load_texture(name, image, egui::TextureOptions::LINEAR)
+}
+
+/// Rasterizes an embedded SVG logo into a transparent canvas, preserving its
+/// aspect ratio and centering it. The source files use different aspect ratios,
+/// so a common canvas keeps the format badges aligned in the collection list.
+fn rasterize_format_icon(svg: &[u8]) -> egui::ColorImage {
+    const WIDTH: u32 = 176;
+    const HEIGHT: u32 = 88;
+
+    let tree = resvg::usvg::Tree::from_data(svg, &resvg::usvg::Options::default())
+        .expect("bundled format icon should parse");
+    let source = tree.size();
+    let scale = (WIDTH as f32 / source.width()).min(HEIGHT as f32 / source.height());
+    let offset_x = (WIDTH as f32 - source.width() * scale) / 2.0;
+    let offset_y = (HEIGHT as f32 - source.height() * scale) / 2.0;
+    let mut pixmap =
+        resvg::tiny_skia::Pixmap::new(WIDTH, HEIGHT).expect("format icon canvas is not empty");
+    resvg::render(
+        &tree,
+        resvg::tiny_skia::Transform::from_scale(scale, scale).post_translate(offset_x, offset_y),
+        &mut pixmap.as_mut(),
+    );
+    egui::ColorImage::from_rgba_premultiplied([WIDTH as usize, HEIGHT as usize], pixmap.data())
 }
 
 fn format_icon(ui: &mut Ui, movie: &Movie, icons: &FormatIcons) {
@@ -1832,6 +2484,108 @@ fn format_badge(ui: &mut Ui, movie: &Movie) {
                     .strong()
                     .color(foreground),
             );
+        });
+}
+
+/// Toolbar button with three stacked lines that opens the action menu.
+fn hamburger_button(ui: &mut Ui) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(Vec2::new(40.0, 30.0), Sense::click());
+    let fill = if response.hovered() {
+        Color32::from_rgb(45, 51, 63)
+    } else {
+        CARD_BG
+    };
+    let painter = ui.painter();
+    painter.rect(
+        rect,
+        CornerRadius::same(7),
+        fill,
+        Stroke::new(1.0, BORDER),
+        StrokeKind::Inside,
+    );
+
+    let center = rect.center();
+    for offset in [-4.5, 0.0, 4.5] {
+        painter.line_segment(
+            [
+                egui::pos2(center.x - 8.0, center.y + offset),
+                egui::pos2(center.x + 8.0, center.y + offset),
+            ],
+            Stroke::new(1.7, TEXT),
+        );
+    }
+
+    response
+        .on_hover_cursor(CursorIcon::PointingHand)
+        .on_hover_text("Menu")
+}
+
+/// One clickable OMDb comparison row. The OMDb value is shown on the left and
+/// the movie's current value beside it. Only the OMDb side is framed, and that
+/// frame turns green when the field is selected.
+fn omdb_change_row(ui: &mut Ui, index: usize, change: &mut omdb::Change) -> egui::Response {
+    let selected = change.selected;
+    let content = ui
+        .vertical(|ui| {
+            ui.label(RichText::new(change.label).strong().size(12.0).color(TEXT));
+            ui.add_space(4.0);
+            ui.columns(2, |columns| {
+                omdb_value(
+                    &mut columns[0],
+                    "OMDb",
+                    &change.incoming,
+                    "OMDb has no value",
+                    selected,
+                );
+                omdb_value(&mut columns[1], "Current", &change.current, "Empty", false);
+            });
+        })
+        .response;
+
+    let response = ui
+        .interact(
+            content.rect,
+            ui.make_persistent_id(("omdb_change", index)),
+            Sense::click(),
+        )
+        .on_hover_cursor(CursorIcon::PointingHand);
+    if response.clicked() {
+        change.selected = !selected;
+    }
+    response
+}
+
+fn omdb_value(ui: &mut Ui, caption: &str, value: &str, empty: &str, selected: bool) {
+    let fill = if selected {
+        Color32::from_rgb(24, 44, 34)
+    } else {
+        CARD_BG
+    };
+    let stroke = if selected {
+        Stroke::new(1.6, SUCCESS)
+    } else {
+        Stroke::new(1.0, BORDER)
+    };
+
+    egui::Frame::new()
+        .inner_margin(Margin::symmetric(10, 7))
+        .corner_radius(CornerRadius::same(7))
+        .fill(fill)
+        .stroke(stroke)
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.label(
+                RichText::new(caption)
+                    .size(10.5)
+                    .strong()
+                    .color(if selected { SUCCESS } else { MUTED }),
+            );
+            ui.add_space(2.0);
+            if value.trim().is_empty() {
+                ui.label(RichText::new(empty).size(12.0).color(MUTED));
+            } else {
+                ui.add(Label::new(RichText::new(value).size(12.5).color(TEXT)).wrap());
+            }
         });
 }
 
@@ -1956,10 +2710,101 @@ fn draw_covers(
     });
 }
 
+const STAR_GOLD: Color32 = Color32::from_rgb(246, 196, 67);
+const STAR_OUTLINE: Color32 = Color32::from_rgb(108, 117, 133);
+
+/// Draws a five-star Letterboxd rating with half-star precision.
+fn draw_rating_stars(ui: &mut Ui, rating: f32) {
+    const COUNT: usize = 5;
+    const SIZE: f32 = 19.0;
+    const GAP: f32 = 3.0;
+
+    let rating = rating.clamp(0.0, COUNT as f32);
+    let width = SIZE * COUNT as f32 + GAP * (COUNT - 1) as f32;
+    let (rect, response) = ui.allocate_exact_size(Vec2::new(width, SIZE), Sense::hover());
+    let _ = response.on_hover_text(format!(
+        "Letterboxd rating: {}",
+        letterboxd_rating_text(rating)
+    ));
+
+    let painter = ui.painter();
+    for index in 0..COUNT {
+        let center = egui::pos2(
+            rect.left() + SIZE / 2.0 + index as f32 * (SIZE + GAP),
+            rect.center().y,
+        );
+        let points = star_points(center, SIZE * 0.48, SIZE * 0.21);
+        let filled = (rating - index as f32).clamp(0.0, 1.0);
+        if filled > 0.0 {
+            let star_rect = Rect::from_center_size(center, Vec2::splat(SIZE));
+            let clip = if filled >= 1.0 {
+                star_rect
+            } else {
+                Rect::from_min_max(
+                    star_rect.min,
+                    egui::pos2(star_rect.left() + SIZE * filled, star_rect.max.y),
+                )
+            };
+            fill_star(&painter.with_clip_rect(clip), center, &points);
+        }
+        painter.add(Shape::closed_line(points, Stroke::new(1.0, STAR_OUTLINE)));
+    }
+}
+
+fn fill_star(painter: &egui::Painter, center: egui::Pos2, points: &[egui::Pos2]) {
+    // A star is concave, so fill it as a fan of triangles around its center
+    // instead of a single convex polygon. A single mesh keeps the triangles
+    // from showing antialiased seams.
+    let mut mesh = egui::Mesh::default();
+    mesh.colored_vertex(center, STAR_GOLD);
+    for &point in points {
+        mesh.colored_vertex(point, STAR_GOLD);
+    }
+    for index in 0..points.len() {
+        mesh.add_triangle(
+            0,
+            (index + 1) as u32,
+            ((index + 1) % points.len() + 1) as u32,
+        );
+    }
+    painter.add(Shape::mesh(mesh));
+}
+
+fn star_points(center: egui::Pos2, outer: f32, inner: f32) -> Vec<egui::Pos2> {
+    (0..10)
+        .map(|index| {
+            let radius = if index % 2 == 0 { outer } else { inner };
+            let angle = -std::f32::consts::FRAC_PI_2 + index as f32 * std::f32::consts::PI / 5.0;
+            egui::pos2(
+                center.x + radius * angle.cos(),
+                center.y + radius * angle.sin(),
+            )
+        })
+        .collect()
+}
+
+fn letterboxd_rating_text(rating: f32) -> String {
+    if rating.fract() == 0.0 {
+        format!("{} / 5", rating as u32)
+    } else {
+        format!("{rating} / 5")
+    }
+}
+
 fn fact(ui: &mut Ui, label: &str, value: &str) {
     ui.label(RichText::new(label).size(11.5).color(MUTED));
     ui.label(RichText::new(value).size(13.0).color(TEXT));
     ui.end_row();
+}
+
+/// Builds the canonical IMDb title URL, accepting only `tt` followed by digits.
+fn imdb_url(imdb_id: &str) -> Option<String> {
+    let id = imdb_id.trim();
+    let digits = id.strip_prefix("tt")?;
+    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    Some(format!("https://www.imdb.com/title/{id}/"))
 }
 
 fn field_label(ui: &mut Ui, text: &str) {
@@ -1977,18 +2822,167 @@ fn string_list(ui: &mut Ui, items: &[String]) {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    #[test]
+    fn hamburger_button_draws_three_lines() {
+        let context = egui::Context::default();
+        let mut output = context.run_ui(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                hamburger_button(ui);
+            });
+        });
+        let lines = output
+            .shapes
+            .iter()
+            .filter(|clipped| matches!(clipped.shape, Shape::LineSegment { .. }))
+            .count();
+        output.textures_delta.clear();
+        assert_eq!(lines, 3);
+    }
+
+    #[test]
+    fn editing_the_title_rebuilds_the_sort_title() {
+        let original = Movie {
+            id: "1".to_string(),
+            title: "English Patient, the".to_string(),
+            sort_title: "English Patient, the".to_string(),
+            ..Default::default()
+        };
+        let mut form = MovieForm::from_movie(&original);
+        form.title = "The English Patient".to_string();
+
+        let mut movie = original.clone();
+        form.apply_to(&mut movie).unwrap();
+        assert_eq!(movie.title, "The English Patient");
+        assert_eq!(movie.sort_title, "English Patient, The");
+        assert_eq!(movie.sort_key(), "english patient, the");
+
+        form.sort_title = "Custom title".to_string();
+        form.apply_to(&mut movie).unwrap();
+        assert_eq!(movie.sort_title, "Custom title");
+    }
+
+    #[test]
+    fn builds_imdb_title_links() {
+        assert_eq!(
+            imdb_url("tt0064116").as_deref(),
+            Some("https://www.imdb.com/title/tt0064116/")
+        );
+        assert_eq!(
+            imdb_url(" tt0064116 ").as_deref(),
+            Some("https://www.imdb.com/title/tt0064116/")
+        );
+        assert_eq!(imdb_url(""), None);
+        assert_eq!(imdb_url("nm0000123"), None);
+        assert_eq!(imdb_url("tt12ab"), None);
+    }
+
+    #[test]
+    fn clicking_an_omdb_field_toggles_its_selection() {
+        fn run_frame(
+            context: &egui::Context,
+            input: egui::RawInput,
+            change: &mut omdb::Change,
+            rect: &mut Rect,
+        ) {
+            let mut output = context.run_ui(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    *rect = omdb_change_row(ui, 0, change).rect;
+                });
+            });
+            output.textures_delta.clear();
+        }
+
+        let context = egui::Context::default();
+        let screen = Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(800.0, 600.0));
+        let input = || egui::RawInput {
+            screen_rect: Some(screen),
+            ..Default::default()
+        };
+        let mut change = omdb::Change {
+            field: omdb::Field::Genres,
+            label: "Genres",
+            current: "Crime".to_string(),
+            incoming: "Crime, Drama".to_string(),
+            selected: false,
+        };
+        let mut rect = Rect::NOTHING;
+
+        run_frame(&context, input(), &mut change, &mut rect);
+        assert!(!change.selected);
+        let pos = rect.center();
+
+        let mut moved = input();
+        moved.events.push(egui::Event::PointerMoved(pos));
+        run_frame(&context, moved, &mut change, &mut rect);
+
+        let mut pressed = input();
+        pressed.events.push(egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: Default::default(),
+        });
+        run_frame(&context, pressed, &mut change, &mut rect);
+
+        let mut released = input();
+        released.events.push(egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: Default::default(),
+        });
+        run_frame(&context, released, &mut change, &mut rect);
+
+        assert!(change.selected);
+    }
+
+    #[test]
+    fn draws_one_filled_mesh_per_full_star() {
+        fn mesh_count(rating: f32) -> usize {
+            let context = egui::Context::default();
+            let mut output = context.run_ui(egui::RawInput::default(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| draw_rating_stars(ui, rating));
+            });
+            let count = output
+                .shapes
+                .iter()
+                .filter(|clipped| matches!(clipped.shape, Shape::Mesh(_)))
+                .count();
+            output.textures_delta.clear();
+            count
+        }
+
+        assert_eq!(mesh_count(0.0), 0);
+        assert_eq!(mesh_count(2.5), 3);
+        assert_eq!(mesh_count(5.0), 5);
+    }
+
     #[test]
     fn embedded_format_icons_decode() {
-        for bytes in [
-            include_bytes!("../assets/formats/dvd.png").as_slice(),
-            include_bytes!("../assets/formats/blu_ray.png").as_slice(),
-            include_bytes!("../assets/formats/blu_ray_3d.png").as_slice(),
-            include_bytes!("../assets/formats/ultra_hd.png").as_slice(),
+        for (name, svg) in [
+            (
+                "dvd",
+                include_bytes!("../assets/formats/dvd.svg").as_slice(),
+            ),
+            (
+                "blu-ray",
+                include_bytes!("../assets/formats/blu-ray.svg").as_slice(),
+            ),
+            (
+                "blu-ray-3d",
+                include_bytes!("../assets/formats/blu-ray-3d.svg").as_slice(),
+            ),
+            (
+                "4k-ultra-hd",
+                include_bytes!("../assets/formats/4k-ultra-hd.svg").as_slice(),
+            ),
         ] {
-            let image = image::load_from_memory(bytes)
-                .expect("embedded format icon should decode")
-                .to_rgba8();
-            assert_eq!(image.dimensions(), (176, 88));
+            let image = rasterize_format_icon(svg);
+            assert_eq!(image.size, [176, 88], "{name} has the wrong size");
+            let visible = image.pixels.iter().filter(|pixel| pixel.a() > 0).count();
+            assert!(visible > 500, "{name} rendered almost nothing");
         }
     }
 }
